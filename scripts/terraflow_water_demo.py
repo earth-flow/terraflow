@@ -222,7 +222,12 @@ def parse_json_content(content: str) -> dict[str, Any]:
     return parsed
 
 
-def plan_with_model(llm_url: str, model_state: dict[str, Any], tools: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def plan_with_model(
+    llm_url: str,
+    model_state: dict[str, Any],
+    tools: dict[str, dict[str, Any]],
+    user_prompt: str | None = None,
+) -> dict[str, Any]:
     candidates = [
         {
             "slug": slug,
@@ -236,7 +241,7 @@ def plan_with_model(llm_url: str, model_state: dict[str, Any], tools: dict[str, 
     if len(candidates) < 5:
         raise DemoError(f"Only {len(candidates)} applicable Terrabox tools are available; need at least five")
     prompt = {
-        "task": "Select an executable ordered plan for a paired water-label GeoTIFF engineering demo.",
+        "task": user_prompt or "Select an executable ordered plan for a paired water-label GeoTIFF engineering demo.",
         "constraints": [
             "Use only the supplied available tool slugs.",
             "Select at least five tools.",
@@ -512,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-dir", type=Path, default=Path(DEFAULT_SUMMARY_DIR))
     parser.add_argument("--requested-weight", type=Path, default=Path(DEFAULT_REQUESTED_WEIGHT))
     parser.add_argument("--fallback-weight", type=Path, default=Path(DEFAULT_FALLBACK_WEIGHT))
+    parser.add_argument("--prompt", help="Natural-language task sent to the model planner")
     return parser
 
 
@@ -530,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         toolkits, tools = discover_catalog(args.terrabox_url, api_key)
         catalog = summarize_catalog(toolkits, tools)
         model_state = detect_model(args.llm_url, args.requested_weight, args.fallback_weight)
-        plan = plan_with_model(args.llm_url, model_state, tools)
+        plan = plan_with_model(args.llm_url, model_state, tools, user_prompt=args.prompt)
         summary: dict[str, Any] = {
             "schema_version": "terraflow-water-demo.v1",
             "run_id": run_id,
@@ -548,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
             "catalog": catalog,
             "model": model_state,
             "plan": plan,
+            "request": {"prompt": args.prompt or "paired water-label engineering demo"},
         }
         summary["success_chain"] = run_success_chain(
             args.terrabox_url,

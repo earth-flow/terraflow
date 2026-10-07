@@ -23,7 +23,8 @@ export default defineConfig(({ mode }) => {
 
   const apiRoutes = API_ROUTES || ["^/api/v1/", "^/api/v2/", "/health"];
 
-  const target = env.VITE_PROXY_TARGET || PROXY_TARGET || "http://localhost:7860";
+  const target =
+    env.VITE_PROXY_TARGET || PROXY_TARGET || "http://localhost:7860";
 
   const port = Number(env.VITE_PORT) || PORT || 3000;
 
@@ -87,6 +88,11 @@ export default defineConfig(({ mode }) => {
       port: port,
       proxy: {
         ...proxyTargets,
+        "^/api/water-demo/": {
+          target: env.VITE_WATER_DEMO_API_TARGET || "http://127.0.0.1:7862",
+          changeOrigin: true,
+          secure: false,
+        },
       },
     },
   };

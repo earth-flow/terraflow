@@ -42,6 +42,7 @@ import ModelProvidersPage from "./pages/SettingsPage/pages/ModelProvidersPage";
 import MessagesPage from "./pages/SettingsPage/pages/messagesPage";
 import ShortcutsPage from "./pages/SettingsPage/pages/ShortcutsPage";
 import ViewPage from "./pages/ViewPage";
+import WaterAgentPage from "./pages/WaterAgentPage";
 
 const AdminPage = lazy(() => import("./pages/AdminPage"));
 const LoginAdminPage = lazy(() => import("./pages/AdminPage/LoginPage"));
@@ -145,6 +146,7 @@ const router = createBrowserRouter(
                     />
                   </Route>
                 </Route>
+                <Route path="water-agent" element={<WaterAgentPage />} />
                 <Route path="settings" element={<SettingsPage />}>
                   <Route
                     index

@@ -1,0 +1,27 @@
+.water-agent-page {
+  background:
+    radial-gradient(
+      circle at 85% 0%,
+      hsl(var(--primary) / 0.08),
+      transparent 30rem
+    ), hsl(var(--background));
+}
+.water-agent-status {
+  border-color: hsl(var(--border));
+  background: hsl(var(--muted) / 0.55);
+}
+
+.water-agent-step-success {
+  color: var(--success-foreground);
+  background: var(--success-background);
+}
+
+.water-agent-step-blocked {
+  color: hsl(var(--warning-foreground));
+  background: hsl(var(--warning) / 0.14);
+}
+
+.water-agent-rejection {
+  border: 1px solid hsl(var(--warning) / 0.35);
+  background: hsl(var(--warning) / 0.08);
+}
