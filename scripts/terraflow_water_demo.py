@@ -21,7 +21,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -55,6 +55,44 @@ REQUIRES_PREFLIGHT = {"geo_raster.raster_diff", "geo_water.water_evidence"}
 
 class DemoError(RuntimeError):
     """A user-facing demo failure with enough context for the trace."""
+
+
+ProgressCallback = Callable[[str, str, int | None, int | None, str | None], None]
+
+
+def write_progress(
+    path: Path | None,
+    stage: str,
+    message: str,
+    current_step: int | None = None,
+    total_steps: int | None = None,
+    tool: str | None = None,
+) -> None:
+    """Write a small atomic progress event for the web adapter.
+
+    These are phase and tool-boundary events, not a replacement for a streaming
+    Terrabox execution feed. The CLI remains usable when no progress file is
+    requested.
+    """
+    if path is None:
+        return
+    payload = {
+        "stage": stage,
+        "message": message,
+        "current_step": current_step,
+        "total_steps": total_steps,
+        "tool": tool,
+        "updated_at": utc_now(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        # Progress is advisory; never make the scientific run fail because the
+        # browser-side status file is unavailable.
+        return
 
 
 def utc_now() -> str:
@@ -249,11 +287,13 @@ def plan_with_model(
             "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
             "Run geo_water.water_evidence before geo_basic.pixel_area.",
             "Do not claim flood causation or satellite performance.",
+            "If earlier conversation turns are given, answer the current task in that context.",
+            "Write reason in Simplified Chinese.",
         ],
         "return_schema": {
             "selected_tools": ["tool.slug"],
             "execution_order": ["tool.slug"],
-            "reason": "short explanation",
+            "reason": "short explanation in Simplified Chinese",
         },
         "available_tools": candidates,
     }
@@ -408,11 +448,20 @@ def run_success_chain(
     after: str,
     output_dir: Path,
     model_state: dict[str, Any],
+    progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     evidence_outputs: dict[str, Any] = {}
     preflight_passed = False
     for step, slug in enumerate(plan["execution_order"], start=1):
+        if progress_cb:
+            progress_cb(
+                "executing_success",
+                f"正在执行成功链工具：{slug}",
+                step,
+                len(plan["execution_order"]),
+                slug,
+            )
         if slug in REQUIRES_PREFLIGHT and not preflight_passed:
             raise DemoError(f"Scientific gate refused {slug}: profile preflight has not passed")
         inputs = tool_inputs(
@@ -461,7 +510,16 @@ def run_rejection_chain(
     before: str,
     mismatch: str,
     model_state: dict[str, Any],
+    progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    if progress_cb:
+        progress_cb(
+            "executing_rejection",
+            "正在执行尺寸不一致拒绝链",
+            1,
+            1,
+            "geo_water.raster_profile_preflight",
+        )
     record = call_tool(
         base_url,
         api_key,
@@ -518,13 +576,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requested-weight", type=Path, default=Path(DEFAULT_REQUESTED_WEIGHT))
     parser.add_argument("--fallback-weight", type=Path, default=Path(DEFAULT_FALLBACK_WEIGHT))
     parser.add_argument("--prompt", help="Natural-language task sent to the model planner")
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        help="Optional JSON status file for the web adapter",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    progress_path = args.progress_file
     try:
+        write_progress(progress_path, "starting", "正在启动水体 Agent")
         api_key = load_api_key(args.api_key_file, args.api_key)
         before = require_file(args.fixtures_dir / "before.tif", "before fixture")
         after = require_file(args.fixtures_dir / "after.tif", "after fixture")
@@ -533,8 +598,10 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = args.summary_dir / run_id / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        write_progress(progress_path, "discovering", "正在发现 Terrabox 工具")
         toolkits, tools = discover_catalog(args.terrabox_url, api_key)
         catalog = summarize_catalog(toolkits, tools)
+        write_progress(progress_path, "planning", "正在请求 Qwen 生成工具执行顺序")
         model_state = detect_model(args.llm_url, args.requested_weight, args.fallback_weight)
         plan = plan_with_model(args.llm_url, model_state, tools, user_prompt=args.prompt)
         summary: dict[str, Any] = {
@@ -565,6 +632,9 @@ def main(argv: list[str] | None = None) -> int:
             after=after,
             output_dir=output_dir,
             model_state=model_state,
+            progress_cb=lambda stage, message, current, total, tool: write_progress(
+                progress_path, stage, message, current, total, tool
+            ),
         )
         summary["rejection_chain"] = run_rejection_chain(
             args.terrabox_url,
@@ -573,10 +643,15 @@ def main(argv: list[str] | None = None) -> int:
             before=before,
             mismatch=mismatch,
             model_state=model_state,
+            progress_cb=lambda stage, message, current, total, tool: write_progress(
+                progress_path, stage, message, current, total, tool
+            ),
         )
+        write_progress(progress_path, "recording", "正在整理执行记录和证据索引")
         attach_analytics(args.terrabox_url, api_key, summary)
         summary_path = args.summary_dir / f"terraflow_water_demo_{run_id}.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_progress(progress_path, "complete", "运行完成")
         print(json.dumps({
             "status": "complete",
             "summary_path": str(summary_path),
@@ -593,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
     except DemoError as exc:
+        write_progress(progress_path, "error", str(exc))
         print(json.dumps({"status": "blocked", "run_id": run_id, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

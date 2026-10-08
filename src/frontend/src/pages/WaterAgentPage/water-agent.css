@@ -10,18 +10,43 @@
   border-color: hsl(var(--border));
   background: hsl(var(--muted) / 0.55);
 }
-
 .water-agent-step-success {
   color: var(--success-foreground);
   background: var(--success-background);
 }
-
 .water-agent-step-blocked {
   color: hsl(var(--warning-foreground));
   background: hsl(var(--warning) / 0.14);
 }
-
 .water-agent-rejection {
   border: 1px solid hsl(var(--warning) / 0.35);
   background: hsl(var(--warning) / 0.08);
+}
+.water-agent-progress-bar {
+  background: hsl(var(--primary));
+  transition: width 240ms ease;
+}
+.water-agent-stage {
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--muted));
+}
+.water-agent-stage-active {
+  color: hsl(var(--primary-foreground));
+  background: hsl(var(--primary));
+}
+.water-agent-message {
+  border-left: 3px solid hsl(var(--border));
+  border-radius: 0.75rem;
+  background: hsl(var(--muted) / 0.35);
+  padding: 0.75rem 1rem;
+}
+.water-agent-message-user {
+  border-left-color: hsl(var(--primary));
+}
+.water-agent-detail-button {
+  color: hsl(var(--primary));
+}
+.water-agent-evidence {
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--muted) / 0.35);
 }

@@ -1,9 +1,8 @@
 import "./water-agent.css";
-import { type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 
 type RunStatus = "idle" | "running" | "complete" | "error";
-
 type Step = {
   step: number;
   tool_slug: string;
@@ -11,28 +10,30 @@ type Step = {
   success: boolean;
   execution_blocked?: boolean;
   reason_code?: string;
+  failed_checks?: string[];
   manifest_path?: string;
+  manifest_exists?: boolean;
   trace_id?: string;
+  inputs?: unknown;
+  outputs?: unknown;
   error?: string;
 };
-
 type DemoSummary = {
   run_id: string;
   created_at: string;
+  request?: { prompt?: string };
+  web_request?: { fixture_id?: string; conversation_turns?: number };
   model?: {
     model_requested?: string;
     model_used?: string;
     endpoint_model_id?: string;
     fallback_reason?: string | null;
   };
-  plan?: {
-    status?: string;
-    execution_order?: string[];
-    reason?: string;
-  };
+  plan?: { status?: string; execution_order?: string[]; reason?: string };
   success_chain?: {
     status?: string;
     fixture_type?: string;
+    execution_count?: number;
     steps?: Step[];
   };
   rejection_chain?: {
@@ -41,76 +42,318 @@ type DemoSummary = {
     failed_checks?: string[];
     steps?: Step[];
   };
-  analytics?: {
-    matched_count?: number;
-    expected_count?: number;
-  };
+  analytics?: { matched_count?: number; expected_count?: number };
   fixtures?: {
     type?: string;
+    before?: string;
+    after?: string;
+    mismatch?: string;
     claim_boundary?: string;
   };
 };
-
-type ApiResponse = {
+type FixtureOption = {
+  id: string;
+  label: string;
+  description: string;
+  type: string;
+};
+type EvidenceRecord = Step & {
+  chain: "success_chain" | "rejection_chain";
+  manifest?: Record<string, unknown>;
+};
+type Evidence = {
+  records: EvidenceRecord[];
+  analytics?: {
+    endpoint?: string;
+    matched_count?: number;
+    expected_count?: number;
+    records?: unknown;
+  };
+};
+type HistoryItem = {
+  run_id?: string;
+  job_id?: string;
+  created_at?: string;
+  status?: string;
+  stage?: string;
+  prompt?: string;
+  fixture_id?: string;
+  model_used?: string;
+  execution_count?: number;
+  rejection_reason?: string;
+  error?: string;
+};
+type JobState = {
+  job_id: string;
   status: string;
+  stage?: string;
+  message?: string;
+  current_step?: number | null;
+  total_steps?: number | null;
+  tool?: string | null;
+  run_id?: string;
   summary?: DemoSummary;
   error?: string;
-  cli?: { run_id?: string };
+};
+type ApiResponse = {
+  status: string;
+  job_id?: string;
+  summary?: DemoSummary;
+  error?: string;
+  evidence?: Evidence;
+};
+type Message = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  runId?: string;
 };
 
 const DEFAULT_PROMPT =
   "请分析这组前后栅格，检查水体变化，说明执行了哪些工具，并给出可追溯证据。";
+const STAGES = [
+  { id: "queued", label: "排队" },
+  { id: "starting", label: "启动 runner" },
+  { id: "discovering", label: "发现工具" },
+  { id: "planning", label: "模型规划" },
+  { id: "executing_success", label: "成功链" },
+  { id: "executing_rejection", label: "拒绝链" },
+  { id: "recording", label: "整理证据" },
+  { id: "complete", label: "完成" },
+];
+
+// Terraflow's global fetch interceptor writes into `config.headers`, so every
+// request must pass an init object with a plain headers record.
+function apiFetch(path: string, init: RequestInit = {}) {
+  return fetch(path, {
+    ...init,
+    headers: { ...(init.headers as Record<string, string> | undefined) },
+  });
+}
 
 function displayTool(slug: string) {
   return slug.split(".").at(-1) ?? slug;
 }
-
 function statusLabel(status: RunStatus) {
   if (status === "running") return "Agent 正在执行";
   if (status === "complete") return "已完成";
   if (status === "error") return "执行受阻";
   return "等待输入";
 }
+function stageIndex(stage?: string) {
+  const index = STAGES.findIndex((item) => item.id === stage);
+  return index < 0 ? 0 : index;
+}
+function formatJson(value: unknown) {
+  return value === undefined || value === null
+    ? "—"
+    : JSON.stringify(value, null, 2);
+}
+function historyLabel(item: HistoryItem) {
+  if (item.status === "running" || item.status === "queued")
+    return item.stage || "运行中";
+  if (item.status === "error") return "执行受阻：" + (item.error || "未知原因");
+  return item.prompt || item.run_id || "未命名运行";
+}
+function assistantReply(summary: DemoSummary) {
+  const successCount = summary.success_chain?.steps?.length ?? 0;
+  const reason = summary.plan?.reason?.trim();
+  const rejection = summary.rejection_chain?.reason_code
+    ? "尺寸不一致样本被门控拦截（" +
+      summary.rejection_chain.reason_code +
+      "）。"
+    : "本次没有返回拒绝原因。";
+  return (
+    (reason ? reason + "\n\n" : "") +
+    "已执行 " +
+    successCount +
+    " 个成功链工具；" +
+    rejection
+  );
+}
 
 export default function WaterAgentPage() {
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [status, setStatus] = useState<RunStatus>("idle");
   const [result, setResult] = useState<DemoSummary | null>(null);
+  const [evidence, setEvidence] = useState<Evidence | null>(null);
   const [error, setError] = useState("");
+  const [job, setJob] = useState<JobState | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [fixtures, setFixtures] = useState<FixtureOption[]>([]);
+  const [fixtureId, setFixtureId] = useState("demo-fixtures");
+  const [expandedStep, setExpandedStep] = useState<string | null>(null);
 
   const successSteps = result?.success_chain?.steps ?? [];
   const rejectionSteps = result?.rejection_chain?.steps ?? [];
   const allSteps = useMemo(
     () => [
-      ...successSteps.map((step) => ({ ...step, chain: "成功链" })),
-      ...rejectionSteps.map((step) => ({ ...step, chain: "拒绝链" })),
+      ...successSteps.map((step) => ({ ...step, chain: "成功链" as const })),
+      ...rejectionSteps.map((step) => ({ ...step, chain: "拒绝链" as const })),
     ],
     [successSteps, rejectionSteps],
   );
+  const evidenceByExecution = useMemo(
+    () =>
+      new Map(
+        (evidence?.records ?? []).map((record) => [
+          record.execution_id ?? record.chain + "-" + record.step,
+          record,
+        ]),
+      ),
+    [evidence],
+  );
+
+  useEffect(() => {
+    void Promise.all([
+      apiFetch("/api/water-demo/fixtures").then((response) => response.json()),
+      apiFetch("/api/water-demo/history?limit=12").then((response) =>
+        response.json(),
+      ),
+    ])
+      .then(([fixtureBody, historyBody]) => {
+        if (Array.isArray(fixtureBody.fixtures)) {
+          setFixtures(fixtureBody.fixtures);
+          if (fixtureBody.fixtures[0]?.id)
+            setFixtureId(fixtureBody.fixtures[0].id);
+        }
+        if (Array.isArray(historyBody.runs)) setHistory(historyBody.runs);
+      })
+      .catch(() =>
+        setError("无法读取演示配置和运行历史，请检查网页 adapter 是否启动。"),
+      );
+  }, []);
+
+  async function refreshHistory() {
+    const response = await apiFetch("/api/water-demo/history?limit=12");
+    const body = (await response.json()) as { runs?: HistoryItem[] };
+    if (Array.isArray(body.runs)) setHistory(body.runs);
+  }
+
+  async function loadRun(runId: string) {
+    setError("");
+    try {
+      const runResponse = await apiFetch(
+        "/api/water-demo/runs/" + encodeURIComponent(runId),
+      );
+      const evidenceResponse = await apiFetch(
+        "/api/water-demo/runs/" + encodeURIComponent(runId) + "/evidence",
+      );
+      const runBody = (await runResponse.json()) as ApiResponse;
+      const evidenceBody = (await evidenceResponse.json()) as ApiResponse;
+      if (!runResponse.ok || !runBody.summary)
+        throw new Error(runBody.error || "运行记录无法读取。");
+      setResult(runBody.summary);
+      setEvidence(evidenceBody.evidence ?? null);
+      setStatus("complete");
+      setJob(null);
+      setExpandedStep(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "运行记录无法读取。");
+    }
+  }
+
+  async function pollJob(jobId: string) {
+    for (;;) {
+      const response = await apiFetch(
+        "/api/water-demo/jobs/" + encodeURIComponent(jobId),
+      );
+      const body = (await response.json()) as JobState;
+      if (!response.ok) throw new Error(body.error || "任务状态无法读取。");
+      setJob(body);
+      if (body.status === "complete" && body.summary) {
+        const summary = body.summary;
+        setResult(summary);
+        setStatus("complete");
+        const evidenceResponse = await apiFetch(
+          "/api/water-demo/runs/" +
+            encodeURIComponent(summary.run_id) +
+            "/evidence",
+        );
+        const evidenceBody = (await evidenceResponse.json()) as ApiResponse;
+        setEvidence(evidenceBody.evidence ?? null);
+        setMessages((current) =>
+          current.concat({
+            id: summary.run_id + "-assistant",
+            role: "assistant",
+            runId: summary.run_id,
+            content: assistantReply(summary),
+          }),
+        );
+        await refreshHistory();
+        return;
+      }
+      if (body.status === "error")
+        throw new Error(body.error || body.message || "水体 Agent 执行受阻。");
+      await new Promise((resolve) => window.setTimeout(resolve, 700));
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (status === "running") return;
+    if (status === "running" || !prompt.trim()) return;
+    const currentPrompt = prompt.trim();
+    setMessages((current) =>
+      current.concat({
+        id: String(Date.now()) + "-user",
+        role: "user",
+        content: currentPrompt,
+      }),
+    );
     setStatus("running");
     setError("");
     setResult(null);
+    setEvidence(null);
+    setExpandedStep(null);
+    setJob(null);
     try {
-      const response = await fetch("/api/water-demo/run", {
+      const response = await apiFetch("/api/water-demo/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({
+          prompt: currentPrompt,
+          fixture_id: fixtureId,
+          messages,
+        }),
       });
       const body = (await response.json()) as ApiResponse;
-      if (!response.ok || body.status !== "complete" || !body.summary) {
-        throw new Error(body.error || "水体 Agent 没有返回可展示的运行摘要。");
-      }
-      setResult(body.summary);
-      setStatus("complete");
+      if (!response.ok || body.status !== "queued" || !body.job_id)
+        throw new Error(body.error || "水体 Agent 任务没有成功提交。");
+      setJob({
+        job_id: body.job_id,
+        status: "queued",
+        stage: "queued",
+        message: "任务已提交",
+      });
+      await pollJob(body.job_id);
     } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "网页请求失败";
       setStatus("error");
-      setError(cause instanceof Error ? cause.message : "网页请求失败");
+      setError(message);
+      setMessages((current) =>
+        current.concat({
+          id: String(Date.now()) + "-assistant-error",
+          role: "assistant",
+          content: "这次任务没有完成：" + message,
+        }),
+      );
+      await refreshHistory().catch(() => undefined);
     }
   }
+
+  const progress = job
+    ? Math.round(
+        ((stageIndex(job.stage) +
+          (job.stage?.startsWith("executing_") &&
+          job.current_step &&
+          job.total_steps
+            ? job.current_step / job.total_steps
+            : 0)) /
+          (STAGES.length - 1)) *
+          100,
+      )
+    : 0;
 
   return (
     <main className="water-agent-page flex h-full min-h-0 flex-1 flex-col overflow-y-auto bg-background px-6 py-8">
@@ -125,34 +368,61 @@ export default function WaterAgentPage() {
                 水体变化分析
               </h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                用自然语言提交任务。网页端调用同一条 Terraflow
-                水体工程链路，并把模型规划、工具步骤和证据索引放在同一处查看。
+                用自然语言提交任务。每次运行都会保留模型规划、工具步骤、拒绝原因和证据索引；上一轮对话会作为下一轮任务的上下文。
               </p>
             </div>
             <span className="water-agent-status rounded-full border px-3 py-1 text-xs font-medium">
               {statusLabel(status)}
             </span>
           </div>
-
           <form onSubmit={submit} className="mt-6">
-            <label
-              htmlFor="water-agent-prompt"
-              className="mb-2 block text-sm font-medium"
-            >
-              任务描述
-            </label>
-            <textarea
-              id="water-agent-prompt"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={3}
-              maxLength={1200}
-              className="w-full resize-y rounded-xl border border-input bg-background px-4 py-3 text-sm leading-6 outline-none transition focus:ring-2 focus:ring-ring"
-              placeholder="例如：检查前后栅格中的水体变化，并说明哪些检查阻止了不一致输入继续执行。"
-            />
+            <div className="grid gap-4 md:grid-cols-[1fr_18rem]">
+              <div>
+                <label
+                  htmlFor="water-agent-prompt"
+                  className="mb-2 block text-sm font-medium"
+                >
+                  任务描述
+                </label>
+                <textarea
+                  id="water-agent-prompt"
+                  value={prompt}
+                  onChange={(event) => setPrompt(event.target.value)}
+                  rows={3}
+                  maxLength={1200}
+                  className="w-full resize-y rounded-xl border border-input bg-background px-4 py-3 text-sm leading-6 outline-none transition focus:ring-2 focus:ring-ring"
+                  placeholder="例如：检查前后栅格中的水体变化，并说明哪些检查阻止了不一致输入继续执行。"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="water-agent-fixture"
+                  className="mb-2 block text-sm font-medium"
+                >
+                  输入组合
+                </label>
+                <select
+                  id="water-agent-fixture"
+                  value={fixtureId}
+                  onChange={(event) => setFixtureId(event.target.value)}
+                  className="w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  disabled={status === "running"}
+                >
+                  {fixtures.map((fixture) => (
+                    <option key={fixture.id} value={fixture.id}>
+                      {fixture.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  {fixtures.find((fixture) => fixture.id === fixtureId)
+                    ?.description || "当前服务未返回可用输入组合。"}
+                </p>
+              </div>
+            </div>
             <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
               <p className="text-xs text-muted-foreground">
-                当前演示使用可审计的合成工程栅格；结果不会自动解释为洪水因果。
+                当前输入是可审计的合成工程栅格；结果不会自动解释为洪水因果。
               </p>
               <Button
                 type="submit"
@@ -162,7 +432,87 @@ export default function WaterAgentPage() {
               </Button>
             </div>
           </form>
+          {status === "running" && job && (
+            <div className="water-agent-progress mt-5 rounded-xl border border-border bg-muted/30 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="font-medium">
+                  {job.message || "任务处理中"}
+                </span>
+                <span className="font-mono text-xs text-muted-foreground">
+                  {progress}%
+                </span>
+              </div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+                <div
+                  className="water-agent-progress-bar h-full rounded-full"
+                  style={{ width: Math.max(5, progress) + "%" }}
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {STAGES.map((stage) => (
+                  <span
+                    key={stage.id}
+                    className={
+                      "water-agent-stage rounded-full px-2.5 py-1 text-xs " +
+                      (stageIndex(job.stage) >= stageIndex(stage.id)
+                        ? "water-agent-stage-active"
+                        : "")
+                    }
+                  >
+                    {stage.label}
+                  </span>
+                ))}
+              </div>
+              {job.tool && (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  当前工具：
+                  <span className="font-mono">{displayTool(job.tool)}</span>
+                  {job.current_step && job.total_steps
+                    ? "（" + job.current_step + "/" + job.total_steps + "）"
+                    : ""}
+                </p>
+              )}
+            </div>
+          )}
         </header>
+
+        {messages.length > 0 && (
+          <section className="rounded-2xl border border-border bg-card p-5">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="font-semibold">对话记录</h2>
+              <span className="text-xs text-muted-foreground">
+                {messages.length} 条消息
+              </span>
+            </div>
+            <div className="mt-4 space-y-3">
+              {messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={
+                    "water-agent-message " +
+                    (message.role === "user" ? "water-agent-message-user" : "")
+                  }
+                >
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {message.role === "user" ? "你" : "Agent"}
+                  </span>
+                  <p className="mt-1 whitespace-pre-wrap text-sm leading-6">
+                    {message.content}
+                  </p>
+                  {message.runId && (
+                    <button
+                      type="button"
+                      className="mt-2 text-xs text-primary underline"
+                      onClick={() => void loadRun(message.runId!)}
+                    >
+                      查看这次运行
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         {error && (
           <section className="rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
@@ -208,7 +558,6 @@ export default function WaterAgentPage() {
                 </p>
               </div>
             </section>
-
             <section className="grid gap-6 lg:grid-cols-[1.4fr_0.9fr]">
               <div className="rounded-2xl border border-border bg-card p-5">
                 <div className="flex items-center justify-between gap-3">
@@ -226,42 +575,91 @@ export default function WaterAgentPage() {
                   </span>
                 </div>
                 <div className="mt-4 divide-y divide-border">
-                  {allSteps.map((step) => (
-                    <div
-                      key={`${step.chain}-${step.execution_id ?? step.step}`}
-                      className="py-3 first:pt-0 last:pb-0"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-muted-foreground">
-                          {step.chain}
-                        </span>
-                        <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs">
-                          {displayTool(step.tool_slug)}
-                        </span>
-                        <span
-                          className={`rounded-full px-2 py-0.5 text-xs ${step.success && !step.execution_blocked ? "water-agent-step-success" : "water-agent-step-blocked"}`}
-                        >
-                          {step.execution_blocked
-                            ? `已拦截：${step.reason_code ?? "gate"}`
-                            : step.success
-                              ? "完成"
-                              : "失败"}
-                        </span>
-                      </div>
-                      <div className="mt-2 grid gap-1 text-xs text-muted-foreground md:grid-cols-2">
-                        <span>execution: {step.execution_id ?? "—"}</span>
-                        <span>trace: {step.trace_id ?? "—"}</span>
-                        {step.manifest_path && (
-                          <span className="md:col-span-2">
-                            manifest: {step.manifest_path}
+                  {allSteps.map((step) => {
+                    const key =
+                      step.chain + "-" + (step.execution_id ?? step.step);
+                    const detail = evidenceByExecution.get(
+                      step.execution_id ?? step.chain + "-" + step.step,
+                    );
+                    const isOpen = expandedStep === key;
+                    return (
+                      <div key={key} className="py-3 first:pt-0 last:pb-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs text-muted-foreground">
+                            {step.chain}
                           </span>
+                          <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs">
+                            {displayTool(step.tool_slug)}
+                          </span>
+                          <span
+                            className={
+                              "rounded-full px-2 py-0.5 text-xs " +
+                              (step.success && !step.execution_blocked
+                                ? "water-agent-step-success"
+                                : "water-agent-step-blocked")
+                            }
+                          >
+                            {step.execution_blocked
+                              ? "已拦截：" + (step.reason_code ?? "gate")
+                              : step.success
+                                ? "完成"
+                                : "失败"}
+                          </span>
+                          <button
+                            type="button"
+                            className="water-agent-detail-button ml-auto text-xs underline"
+                            onClick={() => setExpandedStep(isOpen ? null : key)}
+                          >
+                            {isOpen ? "收起证据" : "查看证据"}
+                          </button>
+                        </div>
+                        <div className="mt-2 grid gap-1 text-xs text-muted-foreground md:grid-cols-2">
+                          <span>execution: {step.execution_id ?? "—"}</span>
+                          <span>trace: {step.trace_id ?? "—"}</span>
+                          {step.manifest_path && (
+                            <span className="break-all md:col-span-2">
+                              manifest: {step.manifest_path}
+                            </span>
+                          )}
+                        </div>
+                        {isOpen && (
+                          <div className="water-agent-evidence mt-3 space-y-3 rounded-xl p-3">
+                            <div>
+                              <p className="text-xs font-medium">输入</p>
+                              <pre className="mt-1 overflow-x-auto text-[11px] leading-5">
+                                {formatJson(detail?.inputs ?? step.inputs)}
+                              </pre>
+                            </div>
+                            <div>
+                              <p className="text-xs font-medium">
+                                工具输出摘要
+                              </p>
+                              <pre className="mt-1 overflow-x-auto text-[11px] leading-5">
+                                {formatJson(detail?.outputs ?? step.outputs)}
+                              </pre>
+                            </div>
+                            {detail?.manifest && (
+                              <div>
+                                <p className="text-xs font-medium">
+                                  manifest 内容
+                                </p>
+                                <pre className="mt-1 max-h-64 overflow-auto text-[11px] leading-5">
+                                  {formatJson(detail.manifest)}
+                                </pre>
+                              </div>
+                            )}
+                            {step.failed_checks && (
+                              <p className="text-xs text-muted-foreground">
+                                失败检查：{step.failed_checks.join("、")}
+                              </p>
+                            )}
+                          </div>
                         )}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
-
               <div className="rounded-2xl border border-border bg-card p-5">
                 <h2 className="font-semibold">Agent 回应</h2>
                 <p className="mt-3 text-sm leading-6">
@@ -272,9 +670,16 @@ export default function WaterAgentPage() {
                   <p className="font-medium">拒绝链</p>
                   <p className="mt-1 text-muted-foreground">
                     {result.rejection_chain?.reason_code
-                      ? `输入不一致时已停止下游调用（${result.rejection_chain.reason_code}）。`
+                      ? "输入不一致时已停止下游调用（" +
+                        result.rejection_chain.reason_code +
+                        "）。"
                       : "本次未返回拒绝原因。"}
                   </p>
+                  {result.rejection_chain?.failed_checks && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      检查项：{result.rejection_chain.failed_checks.join("、")}
+                    </p>
+                  )}
                 </div>
                 <div className="mt-4 rounded-xl bg-muted/60 p-4 text-xs leading-5 text-muted-foreground">
                   {result.fixtures?.claim_boundary ||
@@ -285,14 +690,66 @@ export default function WaterAgentPage() {
           </>
         )}
 
-        {!result && !error && (
+        <section className="rounded-2xl border border-border bg-card p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-semibold">运行历史</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                历史记录来自 runner 写入的运行摘要。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="text-xs text-primary underline"
+              onClick={() => void refreshHistory()}
+            >
+              刷新
+            </button>
+          </div>
+          {history.length === 0 ? (
+            <p className="mt-4 text-sm text-muted-foreground">
+              还没有可查看的运行。
+            </p>
+          ) : (
+            <div className="mt-4 divide-y divide-border">
+              {history.map((item) => (
+                <div
+                  key={item.job_id ?? item.run_id}
+                  className="flex flex-wrap items-center gap-3 py-3"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm">{historyLabel(item)}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {item.created_at || "—"} · {item.model_used || "等待模型"}{" "}
+                      · {item.execution_count || 0} 条记录
+                    </p>
+                  </div>
+                  {item.status === "complete" && item.run_id ? (
+                    <button
+                      type="button"
+                      className="text-xs text-primary underline"
+                      onClick={() => void loadRun(item.run_id!)}
+                    >
+                      打开
+                    </button>
+                  ) : (
+                    <span className="rounded-full bg-muted px-2 py-1 text-xs">
+                      {item.stage || item.status}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {!result && !error && messages.length === 0 && (
           <section className="rounded-2xl border border-dashed border-border bg-card/50 px-6 py-12 text-center">
             <p className="text-sm font-medium">
-              提交任务后，这里会显示规划和证据记录
+              提交任务后，这里会显示规划、阶段进度和证据记录
             </p>
             <p className="mt-2 text-xs text-muted-foreground">
-              先把命令链路搬到网页端，再逐步增加文件选择、任务历史和 Canvas
-              节点视图。
+              可以继续追问上一轮结果，也可以从运行历史打开之前的记录。
             </p>
           </section>
         )}
