@@ -7,8 +7,10 @@ runner validates that choice against the catalog, then applies the raster
 preflight gate before any pairwise operation.  It records the Terrabox
 execution id, manifest path, and analytics trace for every call.
 
-This demo uses engineering fixtures.  It does not claim satellite coverage,
-flood causation, or a segmentation benchmark result.
+Inputs are described by an optional fixture.json: 0/1 water labels (the
+synthetic engineering fixture when the file is absent) or SAR backscatter,
+which is first turned into threshold water masks.  Results do not claim
+flood causation or a segmentation benchmark result.
 """
 
 from __future__ import annotations
@@ -41,16 +43,29 @@ CORE_TOOL_SLUGS = (
     "geo_water.raster_profile_preflight",
     "geo_raster.raster_stats",
     "geo_raster.threshold_segmentation",
+    "geo_water.sar_water_mask",
     "geo_raster.raster_diff",
     "geo_water.water_evidence",
     "geo_basic.pixel_area",
 )
+# threshold_segmentation marks bright pixels (> threshold) as 255, which is the
+# wrong direction for SAR water; sar_water_mask only applies to backscatter.
+EXCLUDED_BY_INPUT_KIND = {
+    "water_labels": {"geo_water.sar_water_mask"},
+    "sar_backscatter": {"geo_raster.threshold_segmentation"},
+}
 PAIRWISE_TOOL_SLUGS = {
     "geo_water.raster_profile_preflight",
     "geo_raster.raster_diff",
     "geo_water.water_evidence",
 }
 REQUIRES_PREFLIGHT = {"geo_raster.raster_diff", "geo_water.water_evidence"}
+SYNTHETIC_FIXTURE = {
+    "type": "synthetic_engineering_fixture",
+    "input_kind": "water_labels",
+    "label": "标准合成前后栅格",
+    "claim_boundary": "water labels do not establish flood causation or satellite performance",
+}
 
 
 class DemoError(RuntimeError):
@@ -125,6 +140,26 @@ def require_file(path: Path, label: str) -> str:
     if not path.exists():
         raise DemoError(f"{label} does not exist: {path}")
     return str(path)
+
+
+def load_fixture_meta(fixtures_dir: Path) -> dict[str, Any]:
+    """Read fixture.json; directories without one are the synthetic label fixture."""
+    path = fixtures_dir / "fixture.json"
+    if not path.exists():
+        return dict(SYNTHETIC_FIXTURE)
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DemoError(f"fixture.json is unreadable: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise DemoError("fixture.json must contain an object")
+    if meta.get("type") == "sentinel1_rtc_gamma0":
+        meta.setdefault("input_kind", "sar_backscatter")
+    if meta.get("input_kind") not in EXCLUDED_BY_INPUT_KIND:
+        raise DemoError(f"Unsupported fixture input_kind: {meta.get('input_kind')}")
+    if meta["input_kind"] == "sar_backscatter" and meta.get("input_scale", "linear") not in ("linear", "db"):
+        raise DemoError(f"Unsupported SAR input_scale: {meta.get('input_scale')}")
+    return meta
 
 
 def load_api_key(path: Path | None, explicit: str | None) -> str:
@@ -265,7 +300,9 @@ def plan_with_model(
     model_state: dict[str, Any],
     tools: dict[str, dict[str, Any]],
     user_prompt: str | None = None,
+    input_kind: str = "water_labels",
 ) -> dict[str, Any]:
+    excluded = EXCLUDED_BY_INPUT_KIND[input_kind]
     candidates = [
         {
             "slug": slug,
@@ -274,18 +311,27 @@ def plan_with_model(
             "parameters": tools[slug].get("parameters"),
         }
         for slug in CORE_TOOL_SLUGS
-        if slug in tools and tools[slug].get("status") == "available"
+        if slug not in excluded and slug in tools and tools[slug].get("status") == "available"
     ]
+    if input_kind == "sar_backscatter" and "geo_water.sar_water_mask" not in {item["slug"] for item in candidates}:
+        raise DemoError("SAR input needs geo_water.sar_water_mask, which Terrabox does not report as available")
     if len(candidates) < 5:
         raise DemoError(f"Only {len(candidates)} applicable Terrabox tools are available; need at least five")
+    constraints = [
+        "Use only the supplied available tool slugs.",
+        "Select at least five tools.",
+        "Inspect a raster before pairwise work.",
+        "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
+        "Run geo_water.water_evidence before geo_basic.pixel_area.",
+    ]
+    if input_kind == "sar_backscatter":
+        constraints.append(
+            "Inputs are SAR backscatter, not water labels: run geo_water.sar_water_mask before geo_water.water_evidence."
+        )
     prompt = {
-        "task": user_prompt or "Select an executable ordered plan for a paired water-label GeoTIFF engineering demo.",
-        "constraints": [
-            "Use only the supplied available tool slugs.",
-            "Select at least five tools.",
-            "Inspect a raster before pairwise work.",
-            "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
-            "Run geo_water.water_evidence before geo_basic.pixel_area.",
+        "task": user_prompt or "Select an executable ordered plan for a paired water GeoTIFF analysis.",
+        "input_kind": input_kind,
+        "constraints": constraints + [
             "Do not claim flood causation or satellite performance.",
             "If earlier conversation turns are given, answer the current task in that context.",
             "Write reason in Simplified Chinese.",
@@ -322,8 +368,12 @@ def plan_with_model(
     order = parsed.get("execution_order") or selected
     if not isinstance(selected, list) or not isinstance(order, list):
         raise DemoError("Qwen plan must contain selected_tools and execution_order arrays")
-    selected = [str(item) for item in selected]
-    order = [str(item) for item in order]
+    raw_order = [str(item) for item in order]
+    # A tool listed twice would run twice; keep the first occurrence and record
+    # what the model returned so the normalisation stays visible in the trace.
+    selected = list(dict.fromkeys(str(item) for item in selected))
+    order = list(dict.fromkeys(raw_order))
+    removed_duplicates = [slug for index, slug in enumerate(raw_order) if slug in raw_order[:index]]
     candidate_slugs = {item["slug"] for item in candidates}
     if len(selected) < 5:
         raise DemoError(f"Qwen selected only {len(selected)} tools; refusing an underspecified demo plan")
@@ -338,11 +388,17 @@ def plan_with_model(
         raise DemoError("Qwen plan places pairwise analysis before profile preflight")
     if "geo_basic.pixel_area" in order and order.index("geo_basic.pixel_area") < order.index("geo_water.water_evidence"):
         raise DemoError("Qwen plan places pixel-area calculation before water evidence")
+    if input_kind == "sar_backscatter" and (
+        "geo_water.sar_water_mask" not in order
+        or order.index("geo_water.sar_water_mask") > order.index("geo_water.water_evidence")
+    ):
+        raise DemoError("Qwen plan must derive SAR water masks before water evidence")
     return {
         "status": "real_model_plan",
         "response_id": response.get("id"),
         "selected_tools": selected,
         "execution_order": order,
+        "removed_duplicates": removed_duplicates,
         "reason": parsed.get("reason"),
         "candidates": candidates,
     }
@@ -362,13 +418,14 @@ def call_tool(
     slug: str,
     inputs: dict[str, Any],
     model_state: dict[str, Any],
+    scenario: str = "paired_water_water_labels",
 ) -> dict[str, Any]:
     call_id = execution_id(run_id, chain, step)
     metadata = {
         "execution_id": call_id,
         "demo_id": run_id,
         "chain_id": chain,
-        "scenario": "paired_water_label_engineering_fixture",
+        "scenario": scenario,
         "model_requested": model_state["model_requested"],
         "model_used": model_state["model_used"],
     }
@@ -429,13 +486,30 @@ def tool_inputs(
             "output_path": str(output_dir / f"step_{step:02d}_difference.tif"),
         }
     if slug == "geo_water.water_evidence":
-        return {"before_path": before, "after_path": after}
+        # SAR runs compare the derived 0/1 masks, label fixtures compare the inputs.
+        masks = evidence_outputs.get("water_masks") or {}
+        return {"before_path": masks.get("before", before), "after_path": masks.get("after", after)}
     if slug == "geo_basic.pixel_area":
         pixels = evidence_outputs.get("after_water_pixels")
-        if pixels is None:
-            raise DemoError("pixel_area requires the water_evidence output")
-        return {"pixels": pixels, "gsd_x_m": 10.0, "gsd_y_m": 10.0}
+        resolution = evidence_outputs.get("resolution")
+        if pixels is None or not resolution:
+            raise DemoError("pixel_area requires the preflight grid and the water_evidence output")
+        return {"pixels": pixels, "gsd_x_m": abs(float(resolution[0])), "gsd_y_m": abs(float(resolution[1]))}
     raise DemoError(f"No safe input builder exists for selected tool {slug}")
+
+
+def gate_refusal(record: dict[str, Any], outputs: dict[str, Any], fixture_type: str, records: list) -> dict[str, Any]:
+    """A scientific gate stopped the chain: a valid outcome, not a runner error."""
+    return {
+        "status": "blocked_by_gate",
+        "fixture_type": fixture_type,
+        "blocked_tool": record["tool_slug"],
+        "reason_code": outputs.get("reason_code"),
+        "failed_checks": outputs.get("failed_checks"),
+        "downstream_tools_skipped": True,
+        "execution_count": len(records),
+        "steps": records,
+    }
 
 
 def run_success_chain(
@@ -448,22 +522,49 @@ def run_success_chain(
     after: str,
     output_dir: Path,
     model_state: dict[str, Any],
+    fixture_meta: dict[str, Any],
     progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     evidence_outputs: dict[str, Any] = {}
     preflight_passed = False
+    fixture_type = fixture_meta["type"]
+    scenario = f"paired_water_{fixture_meta['input_kind']}"
+    total = len(plan["execution_order"])
     for step, slug in enumerate(plan["execution_order"], start=1):
         if progress_cb:
-            progress_cb(
-                "executing_success",
-                f"正在执行成功链工具：{slug}",
-                step,
-                len(plan["execution_order"]),
-                slug,
-            )
+            progress_cb("executing_success", f"正在执行成功链工具：{slug}", step, total, slug)
         if slug in REQUIRES_PREFLIGHT and not preflight_passed:
             raise DemoError(f"Scientific gate refused {slug}: profile preflight has not passed")
+        if slug == "geo_water.sar_water_mask":
+            # Otsu on the after scene, then the same dB threshold on the before
+            # scene, so both dates are classified by one rule.
+            masks: dict[str, str] = {}
+            threshold_db = None
+            for target, source in (("after", after), ("before", before)):
+                inputs = {
+                    "input_path": source,
+                    "output_path": str(output_dir / f"step_{step:02d}_{target}_water_mask.tif"),
+                    "input_scale": fixture_meta.get("input_scale", "linear"),
+                }
+                if threshold_db is not None:
+                    inputs["threshold_db"] = threshold_db
+                record = call_tool(
+                    base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
+                    inputs=inputs, model_state=model_state, scenario=scenario,
+                )
+                record["target"] = target
+                records.append(record)
+                outputs = record.get("outputs") if isinstance(record.get("outputs"), dict) else {}
+                if not record["success"]:
+                    raise DemoError(f"Success chain tool failed: {slug}: {record.get('error')}")
+                if outputs.get("execution_blocked"):
+                    return gate_refusal(record, outputs, fixture_type, records)
+                masks[target] = str(outputs.get("output_path") or inputs["output_path"])
+                threshold_db = outputs.get("threshold_db")
+            evidence_outputs["water_masks"] = masks
+            evidence_outputs["sar_threshold_db"] = threshold_db
+            continue
         inputs = tool_inputs(
             slug,
             before=before,
@@ -473,31 +574,27 @@ def run_success_chain(
             evidence_outputs=evidence_outputs,
         )
         record = call_tool(
-            base_url,
-            api_key,
-            run_id=run_id,
-            chain="success",
-            step=step,
-            slug=slug,
-            inputs=inputs,
-            model_state=model_state,
+            base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
+            inputs=inputs, model_state=model_state, scenario=scenario,
         )
         records.append(record)
         outputs = record.get("outputs") if isinstance(record.get("outputs"), dict) else {}
-        if not record["success"]:
+        if not record["success"] and not outputs.get("execution_blocked"):
             raise DemoError(f"Success chain tool failed: {slug}: {record.get('error')}")
         if slug == "geo_water.raster_profile_preflight":
             if outputs.get("execution_blocked"):
-                raise DemoError(f"Success chain preflight unexpectedly blocked: {outputs.get('reason_code')}")
+                return gate_refusal(record, outputs, fixture_type, records)
             preflight_passed = True
+            evidence_outputs["resolution"] = (outputs.get("before") or {}).get("resolution")
         if slug == "geo_water.water_evidence":
             if outputs.get("execution_blocked") or not outputs.get("change_answerable"):
-                raise DemoError(f"Success chain water evidence was not answerable: {outputs.get('reason_code')}")
+                return gate_refusal(record, outputs, fixture_type, records)
             evidence_outputs.update(outputs)
     return {
         "status": "success",
-        "fixture_type": "synthetic_engineering_fixture",
+        "fixture_type": fixture_type,
         "execution_count": len(records),
+        "sar_threshold_db": evidence_outputs.get("sar_threshold_db"),
         "steps": records,
     }
 
@@ -508,18 +605,20 @@ def run_rejection_chain(
     *,
     run_id: str,
     before: str,
-    mismatch: str,
+    mismatch: str | None,
     model_state: dict[str, Any],
+    fixture_meta: dict[str, Any],
     progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    if mismatch is None:
+        return {
+            "status": "not_run",
+            "fixture_type": fixture_meta["type"],
+            "reason": "no mismatch raster supplied",
+            "steps": [],
+        }
     if progress_cb:
-        progress_cb(
-            "executing_rejection",
-            "正在执行尺寸不一致拒绝链",
-            1,
-            1,
-            "geo_water.raster_profile_preflight",
-        )
+        progress_cb("executing_rejection", "正在执行尺寸不一致拒绝链", 1, 1, "geo_water.raster_profile_preflight")
     record = call_tool(
         base_url,
         api_key,
@@ -529,13 +628,14 @@ def run_rejection_chain(
         slug="geo_water.raster_profile_preflight",
         inputs={"before_path": before, "after_path": mismatch},
         model_state=model_state,
+        scenario=f"paired_water_{fixture_meta['input_kind']}",
     )
     outputs = record.get("outputs") if isinstance(record.get("outputs"), dict) else {}
     if not record["success"] or not outputs.get("execution_blocked"):
         raise DemoError("Mismatch chain did not produce a deterministic execution_blocked refusal")
     return {
         "status": "deterministic_refusal",
-        "fixture_type": "synthetic_engineering_fixture",
+        "fixture_type": fixture_meta["type"],
         "downstream_tools_skipped": True,
         "reason_code": outputs.get("reason_code"),
         "failed_checks": outputs.get("failed_checks"),
@@ -593,7 +693,9 @@ def main(argv: list[str] | None = None) -> int:
         api_key = load_api_key(args.api_key_file, args.api_key)
         before = require_file(args.fixtures_dir / "before.tif", "before fixture")
         after = require_file(args.fixtures_dir / "after.tif", "after fixture")
-        mismatch = require_file(args.fixtures_dir / "mismatch.tif", "mismatch fixture")
+        mismatch_path = args.fixtures_dir / "mismatch.tif"
+        mismatch = str(mismatch_path) if mismatch_path.exists() else None
+        fixture_meta = load_fixture_meta(args.fixtures_dir)
         args.summary_dir.mkdir(parents=True, exist_ok=True)
         output_dir = args.summary_dir / run_id / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +705,9 @@ def main(argv: list[str] | None = None) -> int:
         catalog = summarize_catalog(toolkits, tools)
         write_progress(progress_path, "planning", "正在请求 Qwen 生成工具执行顺序")
         model_state = detect_model(args.llm_url, args.requested_weight, args.fallback_weight)
-        plan = plan_with_model(args.llm_url, model_state, tools, user_prompt=args.prompt)
+        plan = plan_with_model(
+            args.llm_url, model_state, tools, user_prompt=args.prompt, input_kind=fixture_meta["input_kind"]
+        )
         summary: dict[str, Any] = {
             "schema_version": "terraflow-water-demo.v1",
             "run_id": run_id,
@@ -612,11 +716,10 @@ def main(argv: list[str] | None = None) -> int:
             "terrabox_url": args.terrabox_url,
             "branch": "feature/terraflow-water-demo",
             "fixtures": {
-                "type": "synthetic_engineering_fixture",
+                **fixture_meta,
                 "before": before,
                 "after": after,
                 "mismatch": mismatch,
-                "claim_boundary": "water labels do not establish flood causation or satellite performance",
             },
             "catalog": catalog,
             "model": model_state,
@@ -632,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
             after=after,
             output_dir=output_dir,
             model_state=model_state,
+            fixture_meta=fixture_meta,
             progress_cb=lambda stage, message, current, total, tool: write_progress(
                 progress_path, stage, message, current, total, tool
             ),
@@ -643,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             before=before,
             mismatch=mismatch,
             model_state=model_state,
+            fixture_meta=fixture_meta,
             progress_cb=lambda stage, message, current, total, tool: write_progress(
                 progress_path, stage, message, current, total, tool
             ),
@@ -662,8 +767,10 @@ def main(argv: list[str] | None = None) -> int:
             "model_requested": model_state["model_requested"],
             "model_used": model_state["model_used"],
             "fallback_reason": model_state["fallback_reason"],
+            "fixture_type": fixture_meta["type"],
+            "success_status": summary["success_chain"]["status"],
             "success_steps": summary["success_chain"]["execution_count"],
-            "reject_reason": summary["rejection_chain"]["reason_code"],
+            "reject_reason": summary["rejection_chain"].get("reason_code"),
             "analytics_matches": summary.get("analytics", {}).get("matched_count"),
         }, ensure_ascii=False, indent=2))
         return 0

@@ -3,11 +3,12 @@
 
 The adapter keeps the browser away from Terrabox, llama.cpp, and the fixture
 filesystem. It runs the same CLI runner used over SSH, but exposes a small
-job/status/history/evidence API for the custom page.
+job/status/history/evidence API and GeoTIFF upload for the custom page.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -37,13 +38,47 @@ RUNTIME_DIR = Path(
 SUMMARY_DIR = RUNTIME_DIR / "demo-runs"
 FIXTURE_ROOT = RUNTIME_DIR / "demo-fixtures"
 JOB_DIR = RUNTIME_DIR / "web-jobs"
+UPLOAD_ROOT = RUNTIME_DIR / "web-uploads"
 JOB_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+# Uploaded rasters are opened with rasterio from the Terrabox geo environment;
+# the adapter itself stays on the standard library.
+GEO_PYTHON = os.environ.get(
+    "TERRAFLOW_WATER_GEO_PYTHON",
+    "/data2/liyezhuoxin/envs/terrabox-water-demo/bin/python",
+)
+MAX_UPLOAD_BYTES = int(os.environ.get("TERRAFLOW_WATER_MAX_UPLOAD_MB", "64")) * 1024 * 1024
+UPLOAD_ROLES = ("before", "after", "mismatch")
+INPUT_KINDS = {"water_labels", "sar_backscatter"}
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
 
 _JOB_LOCK = threading.RLock()
 _RUN_LOCK = threading.Lock()
 _JOBS: dict[str, dict[str, Any]] = {}
 _ACTIVE_JOB_ID: str | None = None
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+_UPLOAD_ID = re.compile(r"^upl_[0-9a-f]{12}$")
+_VALIDATE_RASTER = """
+import json, sys
+import rasterio
+result = {}
+for path in sys.argv[1:]:
+    try:
+        with rasterio.open(path) as src:
+            result[path] = {
+                "ok": True,
+                "crs": src.crs.to_string() if src.crs else None,
+                "projected": bool(src.crs and src.crs.is_projected),
+                "shape": [src.height, src.width],
+                "count": src.count,
+                "dtype": src.dtypes[0],
+                "nodata": src.nodata,
+                "resolution": list(src.res),
+            }
+    except Exception as exc:
+        result[path] = {"ok": False, "error": str(exc)[:300]}
+print(json.dumps(result))
+"""
 
 
 def utc_now() -> str:
@@ -112,26 +147,191 @@ def update_job(job_id: str, **fields: Any) -> None:
             job["updated_at"] = utc_now()
 
 
+def fixture_source(meta: dict[str, Any]) -> str:
+    if meta.get("type") == "uploaded":
+        return "uploaded"
+    if meta.get("type") == "synthetic_engineering_fixture":
+        return "synthetic"
+    return "observed"
+
+
+def fixture_option(fixture_id: str, path: Path, meta: dict[str, Any]) -> dict[str, Any]:
+    has_mismatch = (path / "mismatch.tif").is_file()
+    scenes = meta.get("scenes") or {}
+    return {
+        "id": fixture_id,
+        "label": meta.get("label") or fixture_id,
+        "description": meta.get("description")
+        or ("包含成功链和尺寸不一致拒绝样本" if has_mismatch else "只有前后两景，不运行拒绝链"),
+        "path": str(path),
+        "type": meta.get("type"),
+        "source": fixture_source(meta),
+        "input_kind": meta.get("input_kind", "water_labels"),
+        "has_mismatch": has_mismatch,
+        "event": meta.get("event"),
+        "scenes": {
+            role: {key: scene.get(key) for key in ("item_id", "datetime", "relative_orbit", "orbit_state", "polarization")}
+            for role, scene in scenes.items()
+            if isinstance(scene, dict)
+        },
+        "grid": meta.get("grid"),
+        "claim_boundary": meta.get("claim_boundary"),
+    }
+
+
 def fixture_options() -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
-    candidates = [FIXTURE_ROOT]
+    candidates: list[tuple[str, Path]] = [("demo-fixtures", FIXTURE_ROOT)]
     if FIXTURE_ROOT.exists():
-        candidates.extend(sorted(path for path in FIXTURE_ROOT.iterdir() if path.is_dir()))
-    for path in candidates:
-        required = all((path / name).is_file() for name in ("before.tif", "after.tif", "mismatch.tif"))
-        if not required:
-            continue
-        fixture_id = "demo-fixtures" if path == FIXTURE_ROOT else path.name
-        options.append(
-            {
-                "id": fixture_id,
-                "label": "标准合成前后栅格" if path == FIXTURE_ROOT else path.name,
-                "description": "包含成功链和尺寸不一致拒绝样本",
-                "path": str(path),
-                "type": "synthetic_engineering_fixture",
-            }
+        candidates.extend((path.name, path) for path in sorted(FIXTURE_ROOT.iterdir()) if path.is_dir())
+    if UPLOAD_ROOT.exists():
+        candidates.extend(
+            (f"upload-{path.name}", path) for path in sorted(UPLOAD_ROOT.iterdir(), reverse=True) if path.is_dir()
         )
+    for fixture_id, path in candidates:
+        if not all((path / name).is_file() for name in ("before.tif", "after.tif")):
+            continue
+        meta_path = path / "fixture.json"
+        if meta_path.is_file():
+            meta = read_json(meta_path)
+            if not isinstance(meta, dict):
+                continue
+        elif path == FIXTURE_ROOT:
+            meta = {"type": "synthetic_engineering_fixture", "label": "标准合成前后栅格", "input_kind": "water_labels"}
+        else:
+            continue
+        options.append(fixture_option(fixture_id, path, meta))
     return options
+
+
+def create_upload(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    input_kind = str(payload.get("input_kind") or "")
+    input_scale = str(payload.get("input_scale") or "linear")
+    if input_kind not in INPUT_KINDS:
+        return 400, {"status": "invalid_request", "error": "input_kind 必须是 water_labels 或 sar_backscatter。"}
+    if input_scale not in ("linear", "db"):
+        return 400, {"status": "invalid_request", "error": "input_scale 必须是 linear 或 db。"}
+    label = str(payload.get("label") or "").strip()[:80] or "上传的前后栅格"
+    upload_id = f"upl_{uuid.uuid4().hex[:12]}"
+    directory = UPLOAD_ROOT / upload_id
+    directory.mkdir(parents=True)
+    state = {
+        "upload_id": upload_id,
+        "status": "pending",
+        "label": label,
+        "input_kind": input_kind,
+        "input_scale": input_scale,
+        "created_at": utc_now(),
+        "files": {},
+    }
+    (directory / "upload.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 201, {"status": "created", "upload_id": upload_id}
+
+
+def upload_dir(upload_id: str) -> Path | None:
+    if not _UPLOAD_ID.fullmatch(upload_id):
+        return None
+    directory = UPLOAD_ROOT / upload_id
+    return directory if (directory / "upload.json").is_file() else None
+
+
+def store_upload_file(upload_id: str, role: str, stream: Any, length: int, filename: str) -> tuple[int, dict[str, Any]]:
+    directory = upload_dir(upload_id)
+    if directory is None:
+        return 404, {"status": "not_found", "error": "上传记录不存在。"}
+    if role not in UPLOAD_ROLES:
+        return 400, {"status": "invalid_request", "error": "文件角色必须是 before、after 或 mismatch。"}
+    state = read_json(directory / "upload.json") or {}
+    if state.get("status") != "pending":
+        return 409, {"status": "conflict", "error": "该上传已经完成，不能再修改文件。"}
+    if length <= 0:
+        return 400, {"status": "invalid_request", "error": "文件为空。"}
+    if length > MAX_UPLOAD_BYTES:
+        return 413, {"status": "too_large", "error": f"单个文件不能超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB。"}
+    target = directory / f"{role}.tif"
+    temporary = directory / f".{role}.part"
+    digest = hashlib.sha256()
+    remaining = length
+    head = b""
+    with temporary.open("wb") as handle:
+        while remaining > 0:
+            chunk = stream.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            if len(head) < 4:
+                head += chunk[: 4 - len(head)]
+            digest.update(chunk)
+            handle.write(chunk)
+            remaining -= len(chunk)
+    if remaining:
+        temporary.unlink(missing_ok=True)
+        return 400, {"status": "invalid_request", "error": "上传在传输中断开。"}
+    if head not in TIFF_MAGIC:
+        temporary.unlink(missing_ok=True)
+        return 415, {"status": "unsupported_type", "error": f"{role} 不是 TIFF/GeoTIFF 文件。"}
+    temporary.replace(target)
+    state.setdefault("files", {})[role] = {
+        "original_name": re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", filename)[:120],
+        "bytes": length,
+        "sha256": digest.hexdigest(),
+    }
+    (directory / "upload.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 200, {"status": "stored", "role": role, "bytes": length}
+
+
+def finalize_upload(upload_id: str) -> tuple[int, dict[str, Any]]:
+    directory = upload_dir(upload_id)
+    if directory is None:
+        return 404, {"status": "not_found", "error": "上传记录不存在。"}
+    state = read_json(directory / "upload.json") or {}
+    files = state.get("files") or {}
+    missing = [role for role in ("before", "after") if role not in files]
+    if missing:
+        return 400, {"status": "invalid_request", "error": "缺少必需的文件：" + "、".join(missing)}
+    paths = [str(directory / f"{role}.tif") for role in files]
+    try:
+        completed = subprocess.run(
+            [GEO_PYTHON, "-I", "-c", _VALIDATE_RASTER, *paths],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        profiles = json.loads(completed.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        return 502, {"status": "validation_unavailable", "error": f"无法检查上传的栅格：{exc}"}
+    problems = []
+    for role in files:
+        profile = profiles.get(str(directory / f"{role}.tif")) or {"ok": False, "error": "未返回检查结果"}
+        files[role]["profile"] = profile
+        if not profile.get("ok"):
+            problems.append(f"{role} 无法作为栅格打开（{profile.get('error')}）")
+        elif not profile.get("crs"):
+            problems.append(f"{role} 缺少坐标参考系")
+        elif profile.get("count") != 1:
+            problems.append(f"{role} 有 {profile.get('count')} 个波段，目前只支持单波段")
+    if problems:
+        return 422, {"status": "invalid_raster", "error": "；".join(problems), "files": files}
+    before_profile = files["before"]["profile"]
+    meta = {
+        "schema_version": "terraflow-water-fixture.v1",
+        "type": "uploaded",
+        "label": state.get("label"),
+        "description": (
+            ("SAR 后向散射" if state.get("input_kind") == "sar_backscatter" else "0/1 水体标签")
+            + f"，{before_profile['shape'][1]}×{before_profile['shape'][0]}，{before_profile['crs']}"
+            + ("，含拒绝样本" if "mismatch" in files else "，不运行拒绝链")
+        ),
+        "input_kind": state.get("input_kind"),
+        "input_scale": state.get("input_scale"),
+        "uploaded_at": state.get("created_at"),
+        "files": files,
+        "claim_boundary": "Uploaded rasters are user-supplied; their source, acquisition time and labels are not verified by Terraflow.",
+    }
+    (directory / "fixture.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    state["status"] = "ready"
+    (directory / "upload.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 200, {"status": "ready", "fixture": fixture_option(f"upload-{upload_id}", directory, meta)}
 
 
 def resolve_fixture(fixture_id: str) -> dict[str, Any] | None:
@@ -158,6 +358,8 @@ def summary_brief(summary: dict[str, Any]) -> dict[str, Any]:
         "prompt": request.get("prompt"),
         "fixture_id": (summary.get("web_request") or {}).get("fixture_id"),
         "fixture_type": fixtures.get("type"),
+        "fixture_label": fixtures.get("label"),
+        "success_status": success.get("status"),
         "model_used": model.get("model_used"),
         "execution_count": int(success.get("execution_count") or len(success.get("steps") or []))
         + len(reject.get("steps") or []),
@@ -218,6 +420,7 @@ def evidence_for_summary(summary: dict[str, Any]) -> dict[str, Any]:
                 "chain": chain_name,
                 "step": step.get("step"),
                 "tool_slug": step.get("tool_slug"),
+                "target": step.get("target"),
                 "execution_id": step.get("execution_id"),
                 "trace_id": step.get("trace_id"),
                 "manifest_path": step.get("manifest_path"),
@@ -362,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -415,8 +618,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, {"status": "not_found", "error": "unknown endpoint"})
 
+    def _read_json_body(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(min(length, 64_000)) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def do_PUT(self) -> None:
+        parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
+        if len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]:
+            self._send(404, {"status": "not_found", "error": "unknown endpoint"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        filename = unquote(self.headers.get("X-File-Name", "") or "")
+        status, body = store_upload_file(parts[3], parts[4], self.rfile, length, filename)
+        if status != 200:
+            # Part of the body may be unread; do not reuse this connection.
+            self.close_connection = True
+        self._send(status, body)
+
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/api/water-demo/run":
+        path = urlsplit(self.path).path.rstrip("/")
+        parts = [unquote(part) for part in path.split("/") if part]
+        if path == "/api/water-demo/uploads":
+            payload = self._read_json_body()
+            if payload is None:
+                self._send(400, {"status": "invalid_request", "error": "请求体必须是 JSON。"})
+                return
+            self._send(*create_upload(payload))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "uploads"] and parts[4] == "finalize":
+            self._send(*finalize_upload(parts[3]))
+            return
+        if path != "/api/water-demo/run":
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})
             return
         try:

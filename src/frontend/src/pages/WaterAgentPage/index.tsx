@@ -1,6 +1,8 @@
 import "./water-agent.css";
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { apiFetch } from "./api";
+import UploadPanel from "./UploadPanel";
 
 type RunStatus = "idle" | "running" | "complete" | "error";
 type Step = {
@@ -14,9 +16,27 @@ type Step = {
   manifest_path?: string;
   manifest_exists?: boolean;
   trace_id?: string;
+  target?: "before" | "after";
   inputs?: unknown;
   outputs?: unknown;
   error?: string;
+};
+type SceneInfo = {
+  item_id?: string;
+  datetime?: string;
+  relative_orbit?: number;
+  orbit_state?: string;
+  polarization?: string;
+};
+type FixtureInfo = {
+  type?: string;
+  label?: string;
+  description?: string;
+  input_kind?: string;
+  event?: string;
+  scenes?: { before?: SceneInfo; after?: SceneInfo };
+  grid?: { crs?: string; shape?: number[]; resolution_m?: number };
+  claim_boundary?: string;
 };
 type DemoSummary = {
   run_id: string;
@@ -34,6 +54,10 @@ type DemoSummary = {
     status?: string;
     fixture_type?: string;
     execution_count?: number;
+    blocked_tool?: string;
+    reason_code?: string;
+    failed_checks?: string[];
+    sar_threshold_db?: number | null;
     steps?: Step[];
   };
   rejection_chain?: {
@@ -43,19 +67,27 @@ type DemoSummary = {
     steps?: Step[];
   };
   analytics?: { matched_count?: number; expected_count?: number };
-  fixtures?: {
-    type?: string;
+  fixtures?: FixtureInfo & {
     before?: string;
     after?: string;
-    mismatch?: string;
-    claim_boundary?: string;
+    mismatch?: string | null;
   };
 };
-type FixtureOption = {
+type FixtureOption = FixtureInfo & {
   id: string;
   label: string;
   description: string;
-  type: string;
+  source: "synthetic" | "observed" | "uploaded";
+  has_mismatch?: boolean;
+};
+type WaterStats = {
+  valid_area_m2?: number;
+  before_water_area_m2?: number;
+  after_water_area_m2?: number;
+  new_water_area_m2?: number;
+  receded_water_area_m2?: number;
+  pixel_area_m2?: number;
+  crs?: string;
 };
 type EvidenceRecord = Step & {
   chain: "success_chain" | "rejection_chain";
@@ -122,14 +154,11 @@ const STAGES = [
   { id: "complete", label: "完成" },
 ];
 
-// Terraflow's global fetch interceptor writes into `config.headers`, so every
-// request must pass an init object with a plain headers record.
-function apiFetch(path: string, init: RequestInit = {}) {
-  return fetch(path, {
-    ...init,
-    headers: { ...(init.headers as Record<string, string> | undefined) },
-  });
-}
+const SOURCE_LABELS = {
+  synthetic: "合成",
+  observed: "真实观测",
+  uploaded: "上传",
+} as const;
 
 function displayTool(slug: string) {
   return slug.split(".").at(-1) ?? slug;
@@ -155,21 +184,71 @@ function historyLabel(item: HistoryItem) {
   if (item.status === "error") return "执行受阻：" + (item.error || "未知原因");
   return item.prompt || item.run_id || "未命名运行";
 }
-function assistantReply(summary: DemoSummary) {
-  const successCount = summary.success_chain?.steps?.length ?? 0;
-  const reason = summary.plan?.reason?.trim();
-  const rejection = summary.rejection_chain?.reason_code
-    ? "尺寸不一致样本被门控拦截（" +
-      summary.rejection_chain.reason_code +
-      "）。"
-    : "本次没有返回拒绝原因。";
+function sceneLine(role: string, scene?: SceneInfo) {
+  if (!scene) return null;
   return (
-    (reason ? reason + "\n\n" : "") +
-    "已执行 " +
-    successCount +
-    " 个成功链工具；" +
-    rejection
+    role +
+    "：" +
+    (scene.datetime ?? "").slice(0, 16).replace("T", " ") +
+    " UTC，" +
+    (scene.polarization ?? "") +
+    "，相对轨道 " +
+    (scene.relative_orbit ?? "—") +
+    "（" +
+    (scene.orbit_state ?? "—") +
+    "）"
   );
+}
+function km2(value?: number) {
+  return value === undefined || value === null
+    ? "—"
+    : (value / 1e6).toFixed(2) + " km²";
+}
+function targetLabel(target?: string) {
+  if (target === "before") return "（前期）";
+  if (target === "after") return "（后期）";
+  return "";
+}
+function waterStats(summary: DemoSummary): WaterStats | null {
+  const step = summary.success_chain?.steps?.find(
+    (item) => item.tool_slug === "geo_water.water_evidence" && item.success,
+  );
+  return step && step.outputs && typeof step.outputs === "object"
+    ? (step.outputs as WaterStats)
+    : null;
+}
+function assistantReply(summary: DemoSummary) {
+  const success = summary.success_chain;
+  const reason = summary.plan?.reason?.trim();
+  const lines: string[] = [];
+  if (success?.status === "blocked_by_gate") {
+    lines.push(
+      "成功链在 " +
+        displayTool(success.blocked_tool ?? "gate") +
+        " 被门控拦截（" +
+        (success.reason_code ?? "未知原因") +
+        "），后续工具没有执行。",
+    );
+  } else {
+    lines.push(
+      "已执行 " + (success?.steps?.length ?? 0) + " 次成功链工具调用。",
+    );
+    const stats = waterStats(summary);
+    if (stats)
+      lines.push(
+        "后期水体 " +
+          km2(stats.after_water_area_m2) +
+          "，相对前期新增 " +
+          km2(stats.new_water_area_m2) +
+          "。",
+      );
+  }
+  const rejection = summary.rejection_chain;
+  if (rejection?.status === "not_run")
+    lines.push("这组输入没有拒绝样本，未运行拒绝链。");
+  else if (rejection?.reason_code)
+    lines.push("拒绝样本被门控拦截（" + rejection.reason_code + "）。");
+  return (reason ? reason + "\n\n" : "") + lines.join("");
 }
 
 export default function WaterAgentPage() {
@@ -185,6 +264,8 @@ export default function WaterAgentPage() {
   const [fixtureId, setFixtureId] = useState("demo-fixtures");
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
 
+  const selectedFixture = fixtures.find((fixture) => fixture.id === fixtureId);
+  const stats = result ? waterStats(result) : null;
   const successSteps = result?.success_chain?.steps ?? [];
   const rejectionSteps = result?.rejection_chain?.steps ?? [];
   const allSteps = useMemo(
@@ -204,6 +285,13 @@ export default function WaterAgentPage() {
       ),
     [evidence],
   );
+
+  async function refreshFixtures(selectId?: string) {
+    const response = await apiFetch("/api/water-demo/fixtures");
+    const body = (await response.json()) as { fixtures?: FixtureOption[] };
+    if (Array.isArray(body.fixtures)) setFixtures(body.fixtures);
+    if (selectId) setFixtureId(selectId);
+  }
 
   useEffect(() => {
     void Promise.all([
@@ -410,19 +498,40 @@ export default function WaterAgentPage() {
                 >
                   {fixtures.map((fixture) => (
                     <option key={fixture.id} value={fixture.id}>
+                      [{SOURCE_LABELS[fixture.source] ?? fixture.source}]{" "}
                       {fixture.label}
                     </option>
                   ))}
                 </select>
-                <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                  {fixtures.find((fixture) => fixture.id === fixtureId)
-                    ?.description || "当前服务未返回可用输入组合。"}
-                </p>
+                <div className="mt-2 space-y-1 text-xs leading-5 text-muted-foreground">
+                  <p>
+                    {selectedFixture?.description ||
+                      "当前服务未返回可用输入组合。"}
+                  </p>
+                  {selectedFixture?.source === "observed" && (
+                    <>
+                      {sceneLine("前期", selectedFixture.scenes?.before) && (
+                        <p>
+                          {sceneLine("前期", selectedFixture.scenes?.before)}
+                        </p>
+                      )}
+                      {sceneLine("后期", selectedFixture.scenes?.after) && (
+                        <p>
+                          {sceneLine("后期", selectedFixture.scenes?.after)}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
             </div>
             <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-              <p className="text-xs text-muted-foreground">
-                当前输入是可审计的合成工程栅格；结果不会自动解释为洪水因果。
+              <p className="max-w-3xl text-xs leading-5 text-muted-foreground">
+                {selectedFixture?.source === "observed"
+                  ? "真实 Sentinel-1 观测。水体掩膜由后向散射阈值估计得到，不是参考标注；前后差异本身不能证明洪水因果。"
+                  : selectedFixture?.source === "uploaded"
+                    ? "用户上传的数据，来源、时相和标签未经系统核实。"
+                    : "可审计的合成工程栅格，只用于检查工具链；结果不解释为洪水因果。"}
               </p>
               <Button
                 type="submit"
@@ -432,6 +541,10 @@ export default function WaterAgentPage() {
               </Button>
             </div>
           </form>
+          <UploadPanel
+            disabled={status === "running"}
+            onUploaded={(id) => refreshFixtures(id)}
+          />
           {status === "running" && job && (
             <div className="water-agent-progress mt-5 rounded-xl border border-border bg-muted/30 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -558,6 +671,55 @@ export default function WaterAgentPage() {
                 </p>
               </div>
             </section>
+            {result.success_chain?.status === "blocked_by_gate" && (
+              <section className="water-agent-rejection rounded-xl p-4 text-sm leading-6">
+                <p className="font-medium">成功链被科学门控拦截</p>
+                <p className="mt-1 text-muted-foreground">
+                  {displayTool(result.success_chain.blocked_tool ?? "gate")}{" "}
+                  返回 {result.success_chain.reason_code ?? "未知原因"}
+                  ，后续工具没有执行。
+                  {result.success_chain.failed_checks?.length
+                    ? "检查项：" + result.success_chain.failed_checks.join("、")
+                    : ""}
+                </p>
+              </section>
+            )}
+            {stats && (
+              <section className="rounded-2xl border border-border bg-card p-5">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <h2 className="font-semibold">水体统计</h2>
+                  <p className="text-xs text-muted-foreground">
+                    只统计两期都有效的像素；单像素面积{" "}
+                    {stats.pixel_area_m2 ?? "—"} m²（{stats.crs ?? "—"}）
+                    {result.success_chain?.sar_threshold_db !== undefined &&
+                    result.success_chain?.sar_threshold_db !== null
+                      ? "；SAR 水体阈值 " +
+                        result.success_chain.sar_threshold_db.toFixed(2) +
+                        " dB（后期影像 Otsu，前期沿用同一阈值）"
+                      : ""}
+                  </p>
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-5">
+                  {[
+                    ["有效面积", stats.valid_area_m2],
+                    ["前期水体", stats.before_water_area_m2],
+                    ["后期水体", stats.after_water_area_m2],
+                    ["新增水体", stats.new_water_area_m2],
+                    ["消退水体", stats.receded_water_area_m2],
+                  ].map(([name, value]) => (
+                    <div
+                      key={name as string}
+                      className="rounded-xl bg-muted/50 p-3"
+                    >
+                      <p className="text-xs text-muted-foreground">{name}</p>
+                      <p className="mt-1 font-medium">
+                        {km2(value as number | undefined)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
             <section className="grid gap-6 lg:grid-cols-[1.4fr_0.9fr]">
               <div className="rounded-2xl border border-border bg-card p-5">
                 <div className="flex items-center justify-between gap-3">
@@ -590,6 +752,7 @@ export default function WaterAgentPage() {
                           </span>
                           <span className="rounded bg-muted px-2 py-0.5 font-mono text-xs">
                             {displayTool(step.tool_slug)}
+                            {targetLabel(step.target)}
                           </span>
                           <span
                             className={
@@ -669,11 +832,13 @@ export default function WaterAgentPage() {
                 <div className="water-agent-rejection mt-5 rounded-xl p-4 text-sm leading-6">
                   <p className="font-medium">拒绝链</p>
                   <p className="mt-1 text-muted-foreground">
-                    {result.rejection_chain?.reason_code
-                      ? "输入不一致时已停止下游调用（" +
-                        result.rejection_chain.reason_code +
-                        "）。"
-                      : "本次未返回拒绝原因。"}
+                    {result.rejection_chain?.status === "not_run"
+                      ? "这组输入没有拒绝样本，未运行拒绝链。"
+                      : result.rejection_chain?.reason_code
+                        ? "输入不一致时已停止下游调用（" +
+                          result.rejection_chain.reason_code +
+                          "）。"
+                        : "本次未返回拒绝原因。"}
                   </p>
                   {result.rejection_chain?.failed_checks && (
                     <p className="mt-2 text-xs text-muted-foreground">
@@ -681,9 +846,23 @@ export default function WaterAgentPage() {
                     </p>
                   )}
                 </div>
-                <div className="mt-4 rounded-xl bg-muted/60 p-4 text-xs leading-5 text-muted-foreground">
-                  {result.fixtures?.claim_boundary ||
-                    "结果仅表示当前工程输入上的工具执行记录。"}
+                <div className="mt-4 space-y-1 rounded-xl bg-muted/60 p-4 text-xs leading-5 text-muted-foreground">
+                  <p className="font-medium text-foreground">
+                    输入：{result.fixtures?.label ?? "—"}
+                  </p>
+                  {result.fixtures?.event && (
+                    <p>事件：{result.fixtures.event}</p>
+                  )}
+                  {sceneLine("前期", result.fixtures?.scenes?.before) && (
+                    <p>{sceneLine("前期", result.fixtures?.scenes?.before)}</p>
+                  )}
+                  {sceneLine("后期", result.fixtures?.scenes?.after) && (
+                    <p>{sceneLine("后期", result.fixtures?.scenes?.after)}</p>
+                  )}
+                  <p>
+                    {result.fixtures?.claim_boundary ||
+                      "结果仅表示当前工程输入上的工具执行记录。"}
+                  </p>
                 </div>
               </div>
             </section>
