@@ -268,6 +268,33 @@ export default function WaterAgentPage() {
   const [fixtures, setFixtures] = useState<FixtureOption[]>([]);
   const [fixtureId, setFixtureId] = useState("demo-fixtures");
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+  const [canvasState, setCanvasState] = useState("");
+
+  async function openCanvas(runId: string) {
+    // Open the tab synchronously so popup blockers allow it, then point it at the flow.
+    const tab = window.open("about:blank", "_blank");
+    setCanvasState("正在生成 Canvas flow…");
+    try {
+      const response = await apiFetch(
+        "/api/water-demo/runs/" + encodeURIComponent(runId) + "/canvas",
+        { method: "POST" },
+      );
+      const body = (await response.json()) as {
+        canvas_path?: string;
+        error?: string;
+      };
+      if (!response.ok || !body.canvas_path)
+        throw new Error(body.error || "Canvas flow 生成失败。");
+      if (tab) tab.location.href = body.canvas_path;
+      else window.location.assign(body.canvas_path);
+      setCanvasState("");
+    } catch (cause) {
+      tab?.close();
+      setCanvasState(
+        cause instanceof Error ? cause.message : "Canvas flow 生成失败。",
+      );
+    }
+  }
 
   const selectedFixture = fixtures.find((fixture) => fixture.id === fixtureId);
   const stats = result ? waterStats(result) : null;
@@ -655,6 +682,18 @@ export default function WaterAgentPage() {
                 <p className="mt-2 break-all font-mono text-xs">
                   {result.run_id}
                 </p>
+                <button
+                  type="button"
+                  className="mt-2 text-xs text-primary underline"
+                  onClick={() => void openCanvas(result.run_id)}
+                >
+                  在 Canvas 中打开
+                </button>
+                {canvasState && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {canvasState}
+                  </p>
+                )}
               </div>
               <div className="rounded-xl border border-border bg-card p-4">
                 <p className="text-xs text-muted-foreground">规划状态</p>

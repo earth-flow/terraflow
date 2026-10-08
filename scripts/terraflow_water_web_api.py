@@ -47,6 +47,11 @@ GEO_PYTHON = os.environ.get(
     "TERRAFLOW_WATER_GEO_PYTHON",
     "/data2/liyezhuoxin/envs/terrabox-water-demo/bin/python",
 )
+# Canvas flows are generated with the Terraflow virtualenv, which provides lfx.
+FLOW_PYTHON = os.environ.get("TERRAFLOW_WATER_FLOW_PYTHON", str(ROOT / ".venv" / "bin" / "python"))
+FLOW_BUILDER = ROOT / "scripts" / "build_water_flow.py"
+CANVAS_INDEX = RUNTIME_DIR / "canvas-flows.json"
+_CANVAS_LOCK = threading.Lock()
 MAX_UPLOAD_BYTES = int(os.environ.get("TERRAFLOW_WATER_MAX_UPLOAD_MB", "64")) * 1024 * 1024
 UPLOAD_ROLES = ("before", "after", "mismatch")
 INPUT_KINDS = {"water_labels", "sar_backscatter"}
@@ -332,6 +337,44 @@ def finalize_upload(upload_id: str) -> tuple[int, dict[str, Any]]:
     state["status"] = "ready"
     (directory / "upload.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     return 200, {"status": "ready", "fixture": fixture_option(f"upload-{upload_id}", directory, meta)}
+
+
+def canvas_flow_for_run(run_id: str, *, force: bool = False) -> tuple[int, dict[str, Any]]:
+    """Create (once) a Terraflow canvas flow from a run's validated plan."""
+    if summary_path_for(run_id) is None:
+        return 404, {"status": "not_found", "error": "运行记录不存在"}
+    with _CANVAS_LOCK:
+        index = read_json(CANVAS_INDEX)
+        index = index if isinstance(index, dict) else {}
+        if run_id in index and not force:
+            return 200, {"status": "exists", **index[run_id]}
+        try:
+            completed = subprocess.run(
+                [FLOW_PYTHON, str(FLOW_BUILDER), "--run-id", run_id, "--runtime-dir", str(RUNTIME_DIR)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 502, {"status": "error", "error": f"无法生成 Canvas flow：{exc}"}
+        result = parse_last_json(completed.stdout) or parse_last_json(completed.stderr) or {}
+        if completed.returncode != 0 or result.get("status") != "created":
+            return 502, {
+                "status": "error",
+                "error": result.get("error") or "Canvas flow 生成失败",
+                "details": result.get("details") or completed.stderr[-1000:],
+            }
+        entry = {
+            "flow_id": result["flow_id"],
+            "canvas_path": result["canvas_path"],
+            "name": result.get("name"),
+            "created_at": utc_now(),
+        }
+        index[run_id] = entry
+        CANVAS_INDEX.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 201, {"status": "created", **entry}
 
 
 def resolve_fixture(fixture_id: str) -> dict[str, Any] | None:
@@ -654,6 +697,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "uploads"] and parts[4] == "finalize":
             self._send(*finalize_upload(parts[3]))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "canvas":
+            force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
+            self._send(*canvas_flow_for_run(parts[3], force=force))
             return
         if path != "/api/water-demo/run":
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})

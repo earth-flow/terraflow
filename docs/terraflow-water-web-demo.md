@@ -112,3 +112,28 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 上传检查使用 `TERRAFLOW_WATER_GEO_PYTHON` 指定的 Python（默认 Terrabox 环境）打开栅格，适配层本身只用标准库。
 
 网页适配层通过子进程传入 `--prompt`、`--fixtures-dir` 和 `--progress-file`，复用 `scripts/terraflow_water_demo.py`，因此 SSH 命令行和网页入口使用相同的工具发现、Qwen 规划、profile/grid 门控以及 manifest/trace/provenance 记录。不传 `--progress-file` 时，命令行行为与之前相同。
+
+## Canvas flow
+
+每次运行的计划都可以生成一个 Terraflow Canvas flow。结果区“运行 ID”下的“在 Canvas 中打开”会调用 `POST /api/water-demo/runs/{run_id}/canvas`：同一次运行只生成一次，映射记录在 `runtime/canvas-flows.json`，加 `?force=1` 可重新生成。
+
+flow 由 `scripts/build_water_flow.py` 生成（需要 Terraflow 虚拟环境里的 lfx）：读取运行摘要中经过 runner 校验的工具顺序，按 runner 的 `SCENARIOS` 预设填参数，用 lfx 自带的 `build_flow_from_spec` 和线上组件目录拼成 flow，再通过 `POST /api/v1/flows/` 保存。也可以不依赖运行，直接为某个输入组合生成模板：
+
+```bash
+.venv/bin/python scripts/build_water_flow.py --input-set thessaly_2023_s1           # 模板
+.venv/bin/python scripts/build_water_flow.py --run-id 20261008_154450_c502d2       # 来自一次运行
+.venv/bin/python scripts/build_water_flow.py --input-set demo-fixtures --dry-run   # 只打印规格
+```
+
+flow 里的节点都是真实组件：
+
+| 节点 | 来源 | 作用 |
+| --- | --- | --- |
+| Water Input Set | `lfx/components/geo_workflow`（Geo Workflow 类别） | 选择 `$TERRAFLOW_WATER_RUNTIME_DIR` 下的输入组合，输出前后影像和拒绝样本路径；没有拒绝样本时停止该分支 |
+| Raster Pair Gate | 同上 | 读取 Raster Profile Preflight 的结果；不通过时停止前后路径两个输出，下游成对分析不执行，Decision 输出原因 |
+| Tool Result Field | 同上 | 从 Terrabox 工具结果中取出 `outputs.output_path`、`outputs.threshold` 等字段，交给下一个工具 |
+| Inspect GeoTIFF、Raster Profile Preflight、Threshold Segmentation、Raster Difference、Water Label Evidence、Pixel → Area | Terrabox 自动生成的组件 | 与 runner 调用的是同一组 Terrabox 工具 |
+
+SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu，求出的阈值经 Tool Result Field 传给前期影像，与 runner 的规则一致。输入组合含 `mismatch.tif` 时，flow 另有一条拒绝分支，其中的 Water Label Evidence 在门控拦截后不会执行。
+
+后端需要设置 `TERRAFLOW_WATER_RUNTIME_DIR`（Water Input Set 用它列出输入组合）。新组件已写入 `src/lfx/src/lfx/_assets/component_index.json`，生产模式无需 `LFX_DEV`。
