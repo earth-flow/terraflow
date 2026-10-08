@@ -55,7 +55,11 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 | 真实观测 | `runtime/demo-fixtures/<name>/` | 由 `scripts/fetch_sentinel1_rtc_pair.py` 生成，带 STAC item、时相、轨道和网格记录 |
 | 上传 | `runtime/web-uploads/upl_*/` | 页面上传，`fixture.json` 记录原文件名、大小、sha256 和栅格检查结果 |
 
-`input_kind` 为 `water_labels` 时，两期栅格直接作为 0/1 标签比较；为 `sar_backscatter` 时，runner 先调用 Terrabox 的 `geo_water.sar_water_mask`：后期影像用 Otsu 求 dB 阈值，前期影像沿用同一阈值，两期都输出 0=非水体、1=水体、255=nodata 的标签，再交给 `geo_water.water_evidence`。对 SAR 输入，候选工具里不提供 `geo_raster.threshold_segmentation`，因为它把高于阈值的像素当作前景，方向与 SAR 水体相反。
+`input_kind` 为 `water_labels` 时，两期栅格直接作为 0/1 标签比较；为 `sar_backscatter` 时，需要先由 Terrabox 的通用算子 `geo_raster.threshold_segmentation` 生成水体标签。
+
+规划器只决定是否执行这一步；怎么执行由 runner 中 `SCENARIOS` 的场景预设固定，不交给模型选择。SAR 的预设是 `sar_low_backscatter_water`：线性值先转成 dB，**低于**阈值的像素记为水体；后期影像用 Otsu（−35～5 dB 直方图）求阈值，前期影像沿用同一阈值；两期都输出 0=非水体、1=水体、255=nodata，再交给 `geo_water.water_evidence`。运行摘要的 `success_chain.derived_labels` 记录所用预设、阈值和单位。
+
+新的输入类型（例如光学 NDWI 水体：高于 0 的像素记为水体）只需在 `SCENARIOS` 增加一条预设并准备测试数据，不需要新写 Terrabox 工具。只有运算本身是新的（配准、阴影掩膜、HAND、永久水体剔除等）才需要新工具。
 
 科学门控拦截（例如上传的两景尺寸不同）是正常结果：运行状态为完成，成功链状态为 `blocked_by_gate`，页面显示被拦截的工具和原因。
 

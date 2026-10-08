@@ -57,7 +57,12 @@ type DemoSummary = {
     blocked_tool?: string;
     reason_code?: string;
     failed_checks?: string[];
-    sar_threshold_db?: number | null;
+    derived_labels?: {
+      tool?: string;
+      preset?: string;
+      threshold?: number | null;
+      units?: string;
+    } | null;
     steps?: Step[];
   };
   rejection_chain?: {
@@ -691,11 +696,17 @@ export default function WaterAgentPage() {
                   <p className="text-xs text-muted-foreground">
                     只统计两期都有效的像素；单像素面积{" "}
                     {stats.pixel_area_m2 ?? "—"} m²（{stats.crs ?? "—"}）
-                    {result.success_chain?.sar_threshold_db !== undefined &&
-                    result.success_chain?.sar_threshold_db !== null
-                      ? "；SAR 水体阈值 " +
-                        result.success_chain.sar_threshold_db.toFixed(2) +
-                        " dB（后期影像 Otsu，前期沿用同一阈值）"
+                    {typeof result.success_chain?.derived_labels?.threshold ===
+                    "number"
+                      ? "；水体阈值 " +
+                        result.success_chain.derived_labels.threshold.toFixed(
+                          2,
+                        ) +
+                        " " +
+                        (result.success_chain.derived_labels.units ?? "") +
+                        "（预设 " +
+                        (result.success_chain.derived_labels.preset ?? "—") +
+                        "：后期影像 Otsu，前期沿用同一阈值）"
                       : ""}
                   </p>
                 </div>

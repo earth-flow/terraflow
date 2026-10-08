@@ -43,16 +43,32 @@ CORE_TOOL_SLUGS = (
     "geo_water.raster_profile_preflight",
     "geo_raster.raster_stats",
     "geo_raster.threshold_segmentation",
-    "geo_water.sar_water_mask",
     "geo_raster.raster_diff",
     "geo_water.water_evidence",
     "geo_basic.pixel_area",
 )
-# threshold_segmentation marks bright pixels (> threshold) as 255, which is the
-# wrong direction for SAR water; sar_water_mask only applies to backscatter.
-EXCLUDED_BY_INPUT_KIND = {
-    "water_labels": {"geo_water.sar_water_mask"},
-    "sar_backscatter": {"geo_raster.threshold_segmentation"},
+# Scenario presets. The planner decides whether a step runs; the input kind
+# fixes how it runs, so scientifically sensitive parameters (threshold
+# direction, units, label values) are never chosen by the model. A new input
+# kind (for example optical NDWI) is a new entry here, not a new tool.
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "water_labels": {"derive_labels": None},
+    "sar_backscatter": {
+        "derive_labels": {
+            "tool": "geo_raster.threshold_segmentation",
+            "preset": "sar_low_backscatter_water",
+            "params": {"direction": "below", "foreground_value": 1, "background_value": 0, "nodata_value": 255},
+            "transform_by_scale": {"linear": "db", "db": "none"},
+            "otsu_range": [-35.0, 5.0],
+            "units": "dB",
+            "rule": "Otsu on the after scene, same threshold reused on the before scene",
+        },
+        "planner_note": (
+            "Inputs are SAR backscatter, not water labels (low backscatter = water). "
+            "Run geo_raster.threshold_segmentation before geo_water.water_evidence; "
+            "the runner fills threshold direction and units from the scenario preset."
+        ),
+    },
 }
 PAIRWISE_TOOL_SLUGS = {
     "geo_water.raster_profile_preflight",
@@ -155,7 +171,7 @@ def load_fixture_meta(fixtures_dir: Path) -> dict[str, Any]:
         raise DemoError("fixture.json must contain an object")
     if meta.get("type") == "sentinel1_rtc_gamma0":
         meta.setdefault("input_kind", "sar_backscatter")
-    if meta.get("input_kind") not in EXCLUDED_BY_INPUT_KIND:
+    if meta.get("input_kind") not in SCENARIOS:
         raise DemoError(f"Unsupported fixture input_kind: {meta.get('input_kind')}")
     if meta["input_kind"] == "sar_backscatter" and meta.get("input_scale", "linear") not in ("linear", "db"):
         raise DemoError(f"Unsupported SAR input_scale: {meta.get('input_scale')}")
@@ -302,7 +318,8 @@ def plan_with_model(
     user_prompt: str | None = None,
     input_kind: str = "water_labels",
 ) -> dict[str, Any]:
-    excluded = EXCLUDED_BY_INPUT_KIND[input_kind]
+    scenario = SCENARIOS[input_kind]
+    derive = scenario["derive_labels"]
     candidates = [
         {
             "slug": slug,
@@ -311,10 +328,10 @@ def plan_with_model(
             "parameters": tools[slug].get("parameters"),
         }
         for slug in CORE_TOOL_SLUGS
-        if slug not in excluded and slug in tools and tools[slug].get("status") == "available"
+        if slug in tools and tools[slug].get("status") == "available"
     ]
-    if input_kind == "sar_backscatter" and "geo_water.sar_water_mask" not in {item["slug"] for item in candidates}:
-        raise DemoError("SAR input needs geo_water.sar_water_mask, which Terrabox does not report as available")
+    if derive and derive["tool"] not in {item["slug"] for item in candidates}:
+        raise DemoError(f"{input_kind} input needs {derive['tool']}, which Terrabox does not report as available")
     if len(candidates) < 5:
         raise DemoError(f"Only {len(candidates)} applicable Terrabox tools are available; need at least five")
     constraints = [
@@ -324,10 +341,8 @@ def plan_with_model(
         "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
         "Run geo_water.water_evidence before geo_basic.pixel_area.",
     ]
-    if input_kind == "sar_backscatter":
-        constraints.append(
-            "Inputs are SAR backscatter, not water labels: run geo_water.sar_water_mask before geo_water.water_evidence."
-        )
+    if scenario.get("planner_note"):
+        constraints.append(scenario["planner_note"])
     prompt = {
         "task": user_prompt or "Select an executable ordered plan for a paired water GeoTIFF analysis.",
         "input_kind": input_kind,
@@ -388,11 +403,10 @@ def plan_with_model(
         raise DemoError("Qwen plan places pairwise analysis before profile preflight")
     if "geo_basic.pixel_area" in order and order.index("geo_basic.pixel_area") < order.index("geo_water.water_evidence"):
         raise DemoError("Qwen plan places pixel-area calculation before water evidence")
-    if input_kind == "sar_backscatter" and (
-        "geo_water.sar_water_mask" not in order
-        or order.index("geo_water.sar_water_mask") > order.index("geo_water.water_evidence")
+    if derive and (
+        derive["tool"] not in order or order.index(derive["tool"]) > order.index("geo_water.water_evidence")
     ):
-        raise DemoError("Qwen plan must derive SAR water masks before water evidence")
+        raise DemoError(f"Qwen plan must run {derive['tool']} before water evidence for {input_kind} input")
     return {
         "status": "real_model_plan",
         "response_id": response.get("id"),
@@ -530,25 +544,29 @@ def run_success_chain(
     preflight_passed = False
     fixture_type = fixture_meta["type"]
     scenario = f"paired_water_{fixture_meta['input_kind']}"
+    derive = SCENARIOS[fixture_meta["input_kind"]]["derive_labels"]
     total = len(plan["execution_order"])
     for step, slug in enumerate(plan["execution_order"], start=1):
         if progress_cb:
             progress_cb("executing_success", f"正在执行成功链工具：{slug}", step, total, slug)
         if slug in REQUIRES_PREFLIGHT and not preflight_passed:
             raise DemoError(f"Scientific gate refused {slug}: profile preflight has not passed")
-        if slug == "geo_water.sar_water_mask":
-            # Otsu on the after scene, then the same dB threshold on the before
+        if derive and slug == derive["tool"]:
+            # Otsu on the after scene, then the same threshold on the before
             # scene, so both dates are classified by one rule.
             masks: dict[str, str] = {}
-            threshold_db = None
+            threshold = None
             for target, source in (("after", after), ("before", before)):
                 inputs = {
                     "input_path": source,
                     "output_path": str(output_dir / f"step_{step:02d}_{target}_water_mask.tif"),
-                    "input_scale": fixture_meta.get("input_scale", "linear"),
+                    **derive["params"],
+                    "input_transform": derive["transform_by_scale"][fixture_meta.get("input_scale", "linear")],
                 }
-                if threshold_db is not None:
-                    inputs["threshold_db"] = threshold_db
+                if threshold is None:
+                    inputs.update(method="otsu", otsu_range=derive["otsu_range"])
+                else:
+                    inputs.update(method="fixed", threshold=threshold)
                 record = call_tool(
                     base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
                     inputs=inputs, model_state=model_state, scenario=scenario,
@@ -561,9 +579,15 @@ def run_success_chain(
                 if outputs.get("execution_blocked"):
                     return gate_refusal(record, outputs, fixture_type, records)
                 masks[target] = str(outputs.get("output_path") or inputs["output_path"])
-                threshold_db = outputs.get("threshold_db")
+                threshold = outputs.get("threshold")
             evidence_outputs["water_masks"] = masks
-            evidence_outputs["sar_threshold_db"] = threshold_db
+            evidence_outputs["derived_labels"] = {
+                "tool": slug,
+                "preset": derive["preset"],
+                "threshold": threshold,
+                "units": derive["units"],
+                "rule": derive["rule"],
+            }
             continue
         inputs = tool_inputs(
             slug,
@@ -594,7 +618,7 @@ def run_success_chain(
         "status": "success",
         "fixture_type": fixture_type,
         "execution_count": len(records),
-        "sar_threshold_db": evidence_outputs.get("sar_threshold_db"),
+        "derived_labels": evidence_outputs.get("derived_labels"),
         "steps": records,
     }
 
