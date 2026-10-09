@@ -165,6 +165,6 @@ SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu�
 
 预览由 `scripts/render_raster_preview.py` 在 Terrabox geo 环境中渲染：SAR 转为 dB 后按 −25～0 dB 拉伸为灰度，0/1 标签中水体为蓝色、非水体为灰色，无效像素透明；只渲染 runtime 目录内的文件，按文件路径、修改时间和大小缓存在 `runtime/previews/`。
 
-数据识别调用本机 Qwen3.5-4B，要求它原文摘出任务中提到的地点、事件或数据类型。适配层只在摘出的文字确实出现在任务中、且与所选数据的标题、地点或事件有重合时才采用；否则视为“没有提到具体数据”，沿用当前选择。任务中出现“合成”或 “synthetic” 时直接对应合成测试栅格。识别结果和用户的选择（改用、沿用、未提及）记录在运行摘要的 `web_request.input_resolution`。
+数据识别调用本机规划模型（默认 Qwen3.8-27B），要求它原文摘出任务中提到的地点、事件或数据类型。适配层只在摘出的文字确实出现在任务中、且与所选数据的标题、地点或事件有重合时才采用；否则视为“没有提到具体数据”，沿用当前选择。任务中出现“合成”或 “synthetic” 时直接对应合成测试栅格。识别结果和用户的选择（改用、沿用、未提及）记录在运行摘要的 `web_request.input_resolution`。
 
 数据卡片的标题、地点、传感器和类别来自 `fixture.json` 的 `title`、`place`、`sensor`、`category`；`category` 为 `synthetic` 或 `test` 的数据归为开发者数据。

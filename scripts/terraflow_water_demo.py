@@ -35,8 +35,13 @@ DEFAULT_LLM_URL = "http://127.0.0.1:8089"
 DEFAULT_RUNTIME_DIR = "/data2/liyezhuoxin/terrabox-water-demo/runtime"
 DEFAULT_FIXTURE_DIR = f"{DEFAULT_RUNTIME_DIR}/demo-fixtures"
 DEFAULT_SUMMARY_DIR = f"{DEFAULT_RUNTIME_DIR}/demo-runs"
-DEFAULT_REQUESTED_WEIGHT = "/data2/liyezhuoxin/graph-agent/models/gguf/unsloth-Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q8_K_XL.gguf"
-DEFAULT_FALLBACK_WEIGHT = "/data2/liyezhuoxin/dispatch/models/Qwen3.5-4B-UD-Q8_K_XL.gguf"
+DEFAULT_REQUESTED_MODEL = "Qwen3.8-27B"
+# Display names for llama.cpp model ids, matched in order on the lower-cased id.
+MODEL_DISPLAY_NAMES = (
+    ("3.8-27b", "Qwen3.8-27B"),
+    ("3.5-9b", "Qwen3.5-9B"),
+    ("3.5-4b", "Qwen3.5-4B"),
+)
 
 CORE_TOOL_SLUGS = (
     "raster_viewer.inspect_geotiff",
@@ -265,34 +270,19 @@ def summarize_catalog(toolkits: list[dict[str, Any]], tools: dict[str, dict[str,
     }
 
 
-def detect_model(llm_url: str, requested_weight: Path, fallback_weight: Path) -> dict[str, Any]:
-    requested_exists = requested_weight.exists()
-    fallback_exists = fallback_weight.exists()
+def detect_model(llm_url: str, requested_model: str) -> dict[str, Any]:
+    """Record which model the endpoint actually serves, and whether it is the requested one."""
     models = request_json(f"{llm_url.rstrip('/')}/v1/models", timeout=30)
     model_id = "unknown"
     if isinstance(models, dict) and models.get("data"):
         model_id = str(models["data"][0].get("id") or "unknown")
     lowered = model_id.lower()
-    if "9b" in lowered:
-        model_used = "Qwen3.5-9B"
-        fallback_reason = None
-    elif "4b" in lowered:
-        model_used = "Qwen3.5-4B"
-        fallback_reason = "requested_weight_not_found" if not requested_exists else "endpoint_model_is_4b"
-    else:
-        model_used = model_id
-        fallback_reason = "endpoint_model_does_not_match_requested_model"
-    if not requested_exists and not fallback_exists:
-        raise DemoError("Neither the requested 9B weight nor the 4B fallback weight exists")
+    model_used = next((name for key, name in MODEL_DISPLAY_NAMES if key in lowered), model_id)
     return {
-        "model_requested": "Qwen3.5-9B",
-        "requested_weight_path": str(requested_weight),
-        "requested_weight_exists": requested_exists,
-        "fallback_weight_path": str(fallback_weight),
-        "fallback_weight_exists": fallback_exists,
+        "model_requested": requested_model,
         "model_used": model_used,
         "endpoint_model_id": model_id,
-        "fallback_reason": fallback_reason,
+        "fallback_reason": None if model_used == requested_model else f"endpoint_serves_{model_id}",
         "llm_endpoint": llm_url,
     }
 
@@ -705,8 +695,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key-file", type=Path, default=Path("/tmp/terrabox-api-key"))
     parser.add_argument("--fixtures-dir", type=Path, default=Path(DEFAULT_FIXTURE_DIR))
     parser.add_argument("--summary-dir", type=Path, default=Path(DEFAULT_SUMMARY_DIR))
-    parser.add_argument("--requested-weight", type=Path, default=Path(DEFAULT_REQUESTED_WEIGHT))
-    parser.add_argument("--fallback-weight", type=Path, default=Path(DEFAULT_FALLBACK_WEIGHT))
+    parser.add_argument(
+        "--requested-model",
+        default=os.environ.get("TERRAFLOW_WATER_PLANNER_MODEL", DEFAULT_REQUESTED_MODEL),
+        help="Model the run is meant to use; a different endpoint model is recorded as a fallback",
+    )
     parser.add_argument("--prompt", help="Natural-language task sent to the model planner")
     parser.add_argument(
         "--self-check",
@@ -741,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
         toolkits, tools = discover_catalog(args.terrabox_url, api_key)
         catalog = summarize_catalog(toolkits, tools)
         write_progress(progress_path, "planning", "正在请求 Qwen 生成工具执行顺序")
-        model_state = detect_model(args.llm_url, args.requested_weight, args.fallback_weight)
+        model_state = detect_model(args.llm_url, args.requested_model)
         plan = plan_with_model(
             args.llm_url, model_state, tools, user_prompt=args.prompt, input_kind=fixture_meta["input_kind"]
         )
