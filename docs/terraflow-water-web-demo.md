@@ -168,3 +168,11 @@ SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu�
 数据识别调用本机规划模型（默认 Qwen3.8-27B），要求它原文摘出任务中提到的地点、事件或数据类型。适配层只在摘出的文字确实出现在任务中、且与所选数据的标题、地点或事件有重合时才采用；否则视为“没有提到具体数据”，沿用当前选择。任务中出现“合成”或 “synthetic” 时直接对应合成测试栅格。识别结果和用户的选择（改用、沿用、未提及）记录在运行摘要的 `web_request.input_resolution`。
 
 数据卡片的标题、地点、传感器和类别来自 `fixture.json` 的 `title`、`place`、`sensor`、`category`；`category` 为 `synthetic` 或 `test` 的数据归为开发者数据。
+
+## 登录与访问控制
+
+Terraflow 关闭自动登录（`TERRAFLOW_AUTO_LOGIN=false`）时，适配层对除 `/api/water-demo/health` 以外的所有请求校验 Terraflow 会话：从 `Authorization: Bearer` 或 `access_token_lf` cookie 取出令牌，调用 `/api/v1/users/whoami` 核对，结果缓存 60 秒，未登录返回 401（影像预览同样受保护）。可用 `TERRAFLOW_WATER_REQUIRE_LOGIN=0` 关闭，仅限只监听本机的开发环境。
+
+生成 Canvas flow 时，适配层把发起请求的用户令牌通过 `TERRAFLOW_ACCESS_TOKEN` 传给 `scripts/build_water_flow.py`，flow 建在该用户名下；脚本单独运行时依次尝试自动登录和 `~/.config/earthmind/terraflow-login.json`（或 `TERRAFLOW_LOGIN_FILE`）中的账号。
+
+通过普通 http（非 localhost）访问时，需设置 `TERRAFLOW_REFRESH_SECURE=false`、`TERRAFLOW_REFRESH_SAME_SITE=lax`，否则浏览器会丢弃刷新令牌 cookie，登录一小时后失效。

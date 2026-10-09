@@ -22,7 +22,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "terraflow_water_demo.py"
@@ -48,6 +50,14 @@ GEO_PYTHON = os.environ.get(
     "TERRAFLOW_WATER_GEO_PYTHON",
     "/data2/liyezhuoxin/envs/terrabox-water-demo/bin/python",
 )
+# When Terraflow runs without auto-login, every request (except health) must
+# carry a valid Terraflow session; it is checked against /api/v1/users/whoami.
+REQUIRE_LOGIN = os.environ.get("TERRAFLOW_WATER_REQUIRE_LOGIN", "1").strip().lower() not in {"0", "false", "no", "off"}
+TERRAFLOW_URL = os.environ.get("TERRAFLOW_BASE_URL", "http://127.0.0.1:7861").rstrip("/")
+SESSION_CACHE_SECONDS = 60
+_SESSION_CACHE: dict[str, float] = {}
+_SESSION_LOCK = threading.Lock()
+
 # Canvas flows are generated with the Terraflow virtualenv, which provides lfx.
 FLOW_PYTHON = os.environ.get("TERRAFLOW_WATER_FLOW_PYTHON", str(ROOT / ".venv" / "bin" / "python"))
 FLOW_BUILDER = ROOT / "scripts" / "build_water_flow.py"
@@ -391,6 +401,41 @@ def finalize_upload(upload_id: str) -> tuple[int, dict[str, Any]]:
     return 200, {"status": "ready", "fixture": fixture_option(f"upload-{upload_id}", directory, meta)}
 
 
+def request_token(headers: Any) -> str | None:
+    """The Terraflow access token from the Authorization header or the access_token_lf cookie."""
+    authorization = headers.get("Authorization") or ""
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip() or None
+    for part in (headers.get("Cookie") or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == "access_token_lf" and value:
+            return unquote(value)
+    return None
+
+
+def session_is_valid(token: str | None) -> bool:
+    if not token:
+        return False
+    now = time.monotonic()
+    with _SESSION_LOCK:
+        expires = _SESSION_CACHE.get(token)
+        if expires and expires > now:
+            return True
+    request = Request(
+        f"{TERRAFLOW_URL}/api/v1/users/whoami",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            valid = response.status == 200
+    except (HTTPError, URLError, OSError):
+        valid = False
+    if valid:
+        with _SESSION_LOCK:
+            _SESSION_CACHE[token] = now + SESSION_CACHE_SECONDS
+    return valid
+
+
 def _load_runner() -> Any:
     """Import the CLI runner (standard library only) for its catalog and presets."""
     spec = importlib.util.spec_from_file_location("terraflow_water_demo", RUNNER)
@@ -473,21 +518,25 @@ def forget_canvas_flow(flow_id: str) -> tuple[int, dict[str, Any]]:
     return 200, {"status": "ok", "removed": len(index) - len(kept)}
 
 
-def canvas_flow_for_run(run_id: str, *, force: bool = False) -> tuple[int, dict[str, Any]]:
+def canvas_flow_for_run(run_id: str, *, force: bool = False, token: str | None = None) -> tuple[int, dict[str, Any]]:
     """Create (once) a Terraflow canvas flow from a run's validated plan."""
     if summary_path_for(run_id) is None:
         return 404, {"status": "not_found", "error": "运行记录不存在"}
-    return _build_canvas_flow(run_id, ["--run-id", run_id], force=force)
+    return _build_canvas_flow(run_id, ["--run-id", run_id], force=force, token=token)
 
 
-def canvas_flow_for_input_set(set_id: str, *, force: bool = False) -> tuple[int, dict[str, Any]]:
+def canvas_flow_for_input_set(
+    set_id: str, *, force: bool = False, token: str | None = None
+) -> tuple[int, dict[str, Any]]:
     """Create (once) a template canvas flow for an input set."""
     if resolve_fixture(set_id) is None:
         return 404, {"status": "not_found", "error": "输入组合不存在"}
-    return _build_canvas_flow(f"template:{set_id}", ["--input-set", set_id], force=force)
+    return _build_canvas_flow(f"template:{set_id}", ["--input-set", set_id], force=force, token=token)
 
 
-def _build_canvas_flow(key: str, source_args: list[str], *, force: bool) -> tuple[int, dict[str, Any]]:
+def _build_canvas_flow(
+    key: str, source_args: list[str], *, force: bool, token: str | None
+) -> tuple[int, dict[str, Any]]:
     with _CANVAS_LOCK:
         index = _read_canvas_index()
         if key in index and not force:
@@ -496,6 +545,8 @@ def _build_canvas_flow(key: str, source_args: list[str], *, force: bool) -> tupl
             completed = subprocess.run(
                 [FLOW_PYTHON, str(FLOW_BUILDER), *source_args, "--runtime-dir", str(RUNTIME_DIR)],
                 cwd=ROOT,
+                # The flow is created for the user who asked for it.
+                env={**os.environ, **({"TERRAFLOW_ACCESS_TOKEN": token} if token else {})},
                 capture_output=True,
                 text=True,
                 timeout=180,
@@ -948,9 +999,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
+    def _authorized(self) -> bool:
+        if not REQUIRE_LOGIN or session_is_valid(request_token(self.headers)):
+            return True
+        self.close_connection = True
+        self._send(401, {"status": "unauthorized", "error": "请先登录 Terraflow。"})
+        return False
+
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         path = parsed.path.rstrip("/")
+        if path != "/api/water-demo/health" and not self._authorized():
+            return
         if path == "/api/water-demo/health":
             with _JOB_LOCK:
                 active = _ACTIVE_JOB_ID
@@ -1019,6 +1079,8 @@ class Handler(BaseHTTPRequestHandler):
         return payload if isinstance(payload, dict) else None
 
     def do_DELETE(self) -> None:
+        if not self._authorized():
+            return
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
         if len(parts) == 4 and parts[:3] == ["api", "water-demo", "canvas-flows"] and _SAFE_ID.fullmatch(parts[3]):
             self._send(*forget_canvas_flow(parts[3]))
@@ -1026,6 +1088,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"status": "not_found", "error": "unknown endpoint"})
 
     def do_PUT(self) -> None:
+        if not self._authorized():
+            return
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
         if len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]:
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})
@@ -1042,6 +1106,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, body)
 
     def do_POST(self) -> None:
+        if not self._authorized():
+            return
         path = urlsplit(self.path).path.rstrip("/")
         parts = [unquote(part) for part in path.split("/") if part]
         if path == "/api/water-demo/resolve-input":
@@ -1064,11 +1130,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "canvas":
             force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
-            self._send(*canvas_flow_for_input_set(parts[3], force=force))
+            self._send(*canvas_flow_for_input_set(parts[3], force=force, token=request_token(self.headers)))
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "canvas":
             force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
-            self._send(*canvas_flow_for_run(parts[3], force=force))
+            self._send(*canvas_flow_for_run(parts[3], force=force, token=request_token(self.headers)))
             return
         if path != "/api/water-demo/run":
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})

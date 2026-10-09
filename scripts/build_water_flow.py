@@ -26,6 +26,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from lfx.graph.flow_builder.builder import build_flow_from_spec
@@ -75,6 +77,30 @@ def http_json(url: str, *, token: str | None = None, payload: Any = None) -> Any
         if response.headers.get("Content-Encoding") == "gzip":
             body = gzip.decompress(body)
         return json.loads(body)
+
+
+def access_token(base_url: str) -> str:
+    """Token of the requesting user (set by the web adapter), else auto-login, else a login file."""
+    token = os.environ.get("TERRAFLOW_ACCESS_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        return http_json(f"{base_url}/api/v1/auto_login")["access_token"]
+    except (HTTPError, KeyError):
+        pass
+    login_file = Path(os.environ.get("TERRAFLOW_LOGIN_FILE", "~/.config/earthmind/terraflow-login.json")).expanduser()
+    credentials = json.loads(login_file.read_text(encoding="utf-8"))
+    form = urlencode({"username": credentials["username"], "password": credentials["password"]}).encode()
+    request = Request(  # noqa: S310 - fixed http(s) Terraflow URL
+        f"{base_url}/api/v1/login",
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    with urlopen(request, timeout=60) as response:  # noqa: S310 - fixed http(s) Terraflow URL
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+    return json.loads(body)["access_token"]
 
 
 def live_registry(base_url: str, token: str) -> dict[str, dict]:
@@ -292,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     base_url = args.terraflow_url.rstrip("/")
-    token = http_json(f"{base_url}/api/v1/auto_login")["access_token"]
+    token = access_token(base_url)
     built = build_flow_from_spec(spec, registry=live_registry(base_url, token))
     if "error" in built:
         print(json.dumps({"status": "error", **built}, ensure_ascii=False), file=sys.stderr)
