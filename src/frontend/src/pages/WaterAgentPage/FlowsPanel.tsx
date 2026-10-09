@@ -128,7 +128,7 @@ export default function FlowsPanel({
           >
             {fixtures.map((fixture) => (
               <option key={fixture.id} value={fixture.id}>
-                {fixture.label}
+                {fixture.title}
               </option>
             ))}
           </select>

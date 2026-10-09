@@ -234,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", nargs="+", help="Tool slugs for a template flow (default per input kind)")
     parser.add_argument("--terraflow-url", default=DEFAULT_TERRAFLOW_URL)
     parser.add_argument("--runtime-dir", type=Path, default=Path(DEFAULT_RUNTIME_DIR))
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Template flows: add the gate self-check branch on the mismatch raster",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the spec without creating the flow")
     return parser
 
@@ -250,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         meta = runner.load_fixture_meta(directory)
         plan = summary["plan"]["execution_order"]
         set_id = input_set_id(directory, runtime_dir)
+        # Mirror the run: only runs that did the gate self-check get the refusal branch.
+        self_check = (summary.get("rejection_chain") or {}).get("status") == "deterministic_refusal"
         flow_key = args.run_id
         description = f"Generated from water-agent run {args.run_id} (Qwen plan validated by the runner)."
     else:
@@ -263,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         meta = runner.load_fixture_meta(directory)
         plan = args.plan or DEFAULT_PLANS[meta["input_kind"]]
+        self_check = args.self_check
         flow_key = f"template_{set_id}"
         description = f"Template water workflow for input set {set_id}."
 
@@ -275,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         plan=plan,
         input_kind=meta["input_kind"],
         input_scale=meta.get("input_scale", "linear"),
-        has_mismatch=(directory / "mismatch.tif").is_file(),
+        has_mismatch=self_check and (directory / "mismatch.tif").is_file(),
         scenarios=runner.SCENARIOS,
         output_dir=output_dir,
     )

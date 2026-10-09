@@ -161,11 +161,55 @@ def fixture_source(meta: dict[str, Any]) -> str:
     return "observed"
 
 
+# Synthetic fixtures and test uploads stay available but are hidden from users by default.
+DEVELOPER_CATEGORIES = {"synthetic", "test"}
+
+
+def fixture_category(meta: dict[str, Any]) -> str:
+    return str(meta.get("category") or fixture_source(meta))
+
+
+def scene_period(scenes: dict[str, Any]) -> str | None:
+    dates = [str((scenes.get(role) or {}).get("datetime") or "")[:10] for role in ("before", "after")]
+    return " → ".join(dates) if all(dates) else None
+
+
+def grid_area_km2(meta: dict[str, Any]) -> float | None:
+    """Footprint of the pair, only when the grid is in metres (projected, recorded resolution)."""
+    grid = meta.get("grid") or {}
+    shape, resolution = grid.get("shape"), grid.get("resolution_m")
+    if not shape or not resolution:
+        profile = ((meta.get("files") or {}).get("before") or {}).get("profile") or {}
+        if not profile.get("projected"):
+            return None
+        shape, res = profile.get("shape"), profile.get("resolution") or [None]
+        resolution = abs(res[0]) if res[0] else None
+        if not shape or not resolution:
+            return None
+    return round(shape[0] * shape[1] * resolution * resolution / 1e6, 2)
+
+
+def default_sensor(meta: dict[str, Any]) -> str:
+    if meta.get("type") == "synthetic_engineering_fixture":
+        return "合成 0/1 水体标签"
+    return "SAR 后向散射" if meta.get("input_kind") == "sar_backscatter" else "0/1 水体标签"
+
+
 def fixture_option(fixture_id: str, path: Path, meta: dict[str, Any]) -> dict[str, Any]:
     has_mismatch = (path / "mismatch.tif").is_file()
     scenes = meta.get("scenes") or {}
+    category = fixture_category(meta)
+    preview_base = f"/api/water-demo/input-sets/{fixture_id}/preview"
     return {
         "id": fixture_id,
+        "title": meta.get("title") or meta.get("label") or fixture_id,
+        "place": meta.get("place"),
+        "period": scene_period(scenes),
+        "sensor": meta.get("sensor") or default_sensor(meta),
+        "area_km2": grid_area_km2(meta),
+        "category": category,
+        "audience": "developer" if category in DEVELOPER_CATEGORIES else "user",
+        "previews": {"before": preview_base + "/before", "after": preview_base + "/after"},
         "label": meta.get("label") or fixture_id,
         "description": meta.get("description")
         or ("包含成功链和尺寸不一致拒绝样本" if has_mismatch else "只有前后两景，不运行拒绝链"),
@@ -203,7 +247,13 @@ def fixture_options() -> list[dict[str, Any]]:
             if not isinstance(meta, dict):
                 continue
         elif path == FIXTURE_ROOT:
-            meta = {"type": "synthetic_engineering_fixture", "label": "标准合成前后栅格", "input_kind": "water_labels"}
+            meta = {
+                "type": "synthetic_engineering_fixture",
+                "label": "标准合成前后栅格",
+                "title": "合成测试栅格（2×2）",
+                "category": "synthetic",
+                "input_kind": "water_labels",
+            }
         else:
             continue
         options.append(fixture_option(fixture_id, path, meta))
@@ -323,6 +373,7 @@ def finalize_upload(upload_id: str) -> tuple[int, dict[str, Any]]:
         "schema_version": "terraflow-water-fixture.v1",
         "type": "uploaded",
         "label": state.get("label"),
+        "category": "uploaded",
         "description": (
             ("SAR 后向散射" if state.get("input_kind") == "sar_backscatter" else "0/1 水体标签")
             + f"，{before_profile['shape'][1]}×{before_profile['shape'][0]}，{before_profile['crs']}"
@@ -472,6 +523,174 @@ def _build_canvas_flow(key: str, source_args: list[str], *, force: bool) -> tupl
         return 201, {"status": "created", **entry}
 
 
+PREVIEW_DIR = RUNTIME_DIR / "previews"
+PREVIEW_RENDERER = ROOT / "scripts" / "render_raster_preview.py"
+
+
+def render_preview(source: Path, mode: str, scale: str = "linear") -> Path | None:
+    """Render (once per file version) a PNG preview of a raster inside the runtime directory."""
+    if not source.is_file() or not inside_runtime(source):
+        return None
+    stat = source.stat()
+    key = hashlib.sha1(
+        f"{source.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{mode}|{scale}".encode()
+    ).hexdigest()[:20]
+    target = PREVIEW_DIR / f"{key}.png"
+    if target.is_file():
+        return target
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        completed = subprocess.run(
+            [GEO_PYTHON, "-I", str(PREVIEW_RENDERER), str(source), str(target), "--mode", mode, "--scale", scale],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return target if completed.returncode == 0 and target.is_file() else None
+
+
+def input_preview(fixture_id: str, role: str) -> Path | None:
+    fixture = resolve_fixture(fixture_id)
+    if fixture is None or role not in UPLOAD_ROLES:
+        return None
+    if fixture["input_kind"] == "sar_backscatter":
+        meta = read_json(Path(fixture["path"]) / "fixture.json") or {}
+        return render_preview(Path(fixture["path"]) / f"{role}.tif", "sar", meta.get("input_scale", "linear"))
+    return render_preview(Path(fixture["path"]) / f"{role}.tif", "labels")
+
+
+RUN_PREVIEWS = ("before", "after", "before_mask", "after_mask")
+
+
+def run_preview(run_id: str, name: str) -> Path | None:
+    summary_file = summary_path_for(run_id)
+    summary = read_json(summary_file) if summary_file else None
+    if not isinstance(summary, dict) or name not in RUN_PREVIEWS:
+        return None
+    fixtures = summary.get("fixtures") or {}
+    sar = fixtures.get("input_kind") == "sar_backscatter"
+    role = name.removesuffix("_mask")
+    if not name.endswith("_mask"):
+        source = fixtures.get(role)
+        if not source:
+            return None
+        if sar:
+            return render_preview(Path(source), "sar", fixtures.get("input_scale", "linear"))
+        return render_preview(Path(source), "labels")
+    if not sar:
+        # Label inputs are already the water masks.
+        return render_preview(Path(fixtures.get(role) or ""), "labels")
+    for step in (summary.get("success_chain") or {}).get("steps") or []:
+        outputs = step.get("outputs") if isinstance(step.get("outputs"), dict) else {}
+        if step.get("target") == role and outputs.get("output_path"):
+            return render_preview(Path(outputs["output_path"]), "labels")
+    return None
+
+
+_LLM_MODEL_ID: dict[str, str] = {}
+
+
+def llm_model_id() -> str:
+    if "id" not in _LLM_MODEL_ID:
+        models = _RUNNER.request_json(f"{_RUNNER.DEFAULT_LLM_URL}/v1/models", timeout=10)
+        _LLM_MODEL_ID["id"] = str(((models or {}).get("data") or [{}])[0].get("id") or "local")
+    return _LLM_MODEL_ID["id"]
+
+
+SYNTHETIC_WORDS = ("合成", "测试", "synthetic", "test")
+
+
+def _mentions_candidate(mentioned: str, option: dict[str, Any]) -> bool:
+    """True when the quoted words share a two-character piece with the candidate's description."""
+    text = " ".join(str(option.get(key) or "") for key in ("title", "place", "event", "label")).lower()
+    words = mentioned.lower()
+    if option.get("category") in DEVELOPER_CATEGORIES and any(word in words for word in SYNTHETIC_WORDS):
+        return True
+    pieces = {words[index : index + 2] for index in range(len(words) - 1)} - {"  "}
+    return any(piece.strip() and piece in text for piece in pieces)
+
+
+def resolve_input_set(prompt: str, current: str | None) -> tuple[int, dict[str, Any]]:
+    """Ask the local model which input set, if any, the task explicitly refers to."""
+    options = fixture_options()
+    candidates = [
+        {
+            key: option.get(key)
+            for key in ("id", "title", "place", "event", "period", "sensor", "category")
+            if option.get(key)
+        }
+        for option in options
+    ]
+    request = {
+        "task": prompt[:MAX_PROMPT_LENGTH],
+        "candidates": candidates,
+        "instructions": [
+            "mentioned must be the exact words copied from the task that name a place, event, date or "
+            "data type; use null if the task names none (for example 'analyse this pair').",
+            "Pick the candidate those words refer to.",
+            "If the task asks for synthetic or test data, pick the candidate whose category is synthetic.",
+            "If the named place or event matches no candidate, return input_set null and unmatched true.",
+            "Do not guess.",
+        ],
+        "return_schema": {
+            "input_set": "candidate id or null",
+            "mentioned": "exact words from the task, or null",
+            "unmatched": False,
+            "reason": "one short sentence in Simplified Chinese",
+        },
+    }
+    try:
+        response = _RUNNER.request_json(
+            f"{_RUNNER.DEFAULT_LLM_URL}/v1/chat/completions",
+            method="POST",
+            payload={
+                "model": llm_model_id(),
+                "temperature": 0,
+                "max_tokens": 256,
+                "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON. Do not include a markdown fence."},
+                    {"role": "user", "content": "/no_think\n" + json.dumps(request, ensure_ascii=False)},
+                ],
+            },
+            timeout=60,
+        )
+        parsed = _RUNNER.parse_json_content(str(response["choices"][0]["message"].get("content") or ""))
+    except (_RUNNER.DemoError, KeyError, IndexError, TypeError) as exc:
+        return 502, {"status": "error", "error": f"无法识别任务中提到的数据：{exc}"}
+    by_id = {option["id"]: option for option in options}
+    chosen = parsed.get("input_set")
+    chosen = chosen if isinstance(chosen, str) and chosen in by_id else None
+    mentioned = parsed.get("mentioned")
+    mentioned = mentioned.strip() if isinstance(mentioned, str) and mentioned.strip() else None
+    # A 4B model sometimes "finds" data the task never named. Keep its answer
+    # only when the quoted words really occur in the task and overlap the
+    # chosen candidate's description; otherwise fall back to the current set.
+    grounded = mentioned is not None and mentioned in prompt
+    if chosen and not (grounded and _mentions_candidate(mentioned, by_id[chosen])):
+        chosen, mentioned = None, (mentioned if grounded else None)
+    if chosen is None:
+        # Deterministic fallback for explicit requests for the synthetic fixture.
+        word = next((word for word in ("合成", "synthetic") if word in prompt.lower()), None)
+        synthetic = next((option for option in options if option.get("category") == "synthetic"), None)
+        if word and synthetic:
+            chosen, mentioned, grounded = synthetic["id"], word, True
+    unmatched = bool(parsed.get("unmatched")) and chosen is None and grounded
+    return 200, {
+        "status": "ok",
+        "input_set": chosen,
+        "mentioned": mentioned if grounded else None,
+        "unmatched": unmatched,
+        "reason": str(parsed.get("reason") or "")[:200] if (chosen or unmatched) else "",
+        "current": current,
+        "model": _LLM_MODEL_ID.get("id"),
+    }
+
+
 def resolve_fixture(fixture_id: str) -> dict[str, Any] | None:
     return next((item for item in fixture_options() if item["id"] == fixture_id), None)
 
@@ -591,7 +810,14 @@ def evidence_for_summary(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_job(job_id: str, prompt: str, fixture: dict[str, Any], conversation_turns: int) -> None:
+def run_job(
+    job_id: str,
+    prompt: str,
+    fixture: dict[str, Any],
+    conversation_turns: int,
+    self_check: bool = False,
+    resolution: dict[str, Any] | None = None,
+) -> None:
     global _ACTIVE_JOB_ID
     progress_path = JOB_DIR / f"{job_id}.json"
     update_job(job_id, status="running", stage="starting", message="正在启动水体 Agent")
@@ -605,6 +831,8 @@ def run_job(job_id: str, prompt: str, fixture: dict[str, Any], conversation_turn
         "--progress-file",
         str(progress_path),
     ]
+    if self_check:
+        command.append("--self-check")
     stdout = ""
     stderr = ""
     try:
@@ -654,6 +882,8 @@ def run_job(job_id: str, prompt: str, fixture: dict[str, Any], conversation_turn
                 "entrypoint": "terraflow-water-web-api",
                 "fixture_id": fixture["id"],
                 "conversation_turns": conversation_turns,
+                "self_check": self_check,
+                "input_resolution": resolution,
             }
             summary_file = summary_path_for(str(summary.get("run_id") or ""))
             if summary_file:
@@ -699,6 +929,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_png(self, path: Path | None) -> None:
+        if path is None:
+            self._send(404, {"status": "not_found", "error": "预览不可用"})
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -740,6 +982,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 6 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "preview":
+            self._send_png(input_preview(parts[3], parts[5]))
+            return
+        if len(parts) == 6 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "preview":
+            self._send_png(run_preview(parts[3], parts[5]))
+            return
         if len(parts) == 4 and parts[:3] == ["api", "water-demo", "jobs"]:
             with _JOB_LOCK:
                 job = _JOBS.get(parts[3])
@@ -796,6 +1044,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path.rstrip("/")
         parts = [unquote(part) for part in path.split("/") if part]
+        if path == "/api/water-demo/resolve-input":
+            payload = self._read_json_body()
+            if payload is None or not str(payload.get("prompt") or "").strip():
+                self._send(400, {"status": "invalid_request", "error": "需要任务描述。"})
+                return
+            current = payload.get("current")
+            self._send(*resolve_input_set(str(payload["prompt"]), str(current) if current else None))
+            return
         if path == "/api/water-demo/uploads":
             payload = self._read_json_body()
             if payload is None:
@@ -831,6 +1087,16 @@ class Handler(BaseHTTPRequestHandler):
         if fixture is None:
             self._send(400, {"status": "invalid_request", "error": "选择的 fixture 不存在或缺少必要栅格。"})
             return
+        self_check = bool(payload.get("self_check"))
+        resolution = payload.get("input_resolution")
+        if isinstance(resolution, dict):
+            resolution = {
+                key: resolution.get(key)
+                for key in ("input_set", "mentioned", "unmatched", "reason", "decision", "model")
+                if key in resolution
+            }
+        else:
+            resolution = None
         messages = payload.get("messages")
         conversation_turns = 0
         if isinstance(messages, list):
@@ -860,10 +1126,11 @@ class Handler(BaseHTTPRequestHandler):
                 "prompt": prompt,
                 "fixture_id": fixture_id,
                 "conversation_turns": conversation_turns,
+                "self_check": self_check,
             }
             thread = threading.Thread(
                 target=run_job,
-                args=(job_id, prompt, fixture, conversation_turns),
+                args=(job_id, prompt, fixture, conversation_turns, self_check, resolution),
                 daemon=True,
                 name=f"water-agent-{job_id}",
             )

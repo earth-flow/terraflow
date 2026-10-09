@@ -64,3 +64,18 @@
   background: hsl(var(--primary) / 0.1);
   color: hsl(var(--primary));
 }
+.water-agent-thumb {
+  background:
+    repeating-conic-gradient(
+      hsl(var(--muted)) 0% 25%,
+      hsl(var(--background)) 0% 50%
+    )
+    50% / 12px 12px;
+}
+.water-agent-dataset:hover {
+  border-color: hsl(var(--primary) / 0.5);
+}
+.water-agent-dataset-selected {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 1px hsl(var(--primary) / 0.4);
+}

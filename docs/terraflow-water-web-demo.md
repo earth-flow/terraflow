@@ -51,17 +51,19 @@ Flow 列表和删除直接调用 Terraflow 的 `/api/v1/flows/`；删除后同�
 ## 页面能展示什么
 
 - 会话消息列表。每次提交时，最近 6 条消息会作为上下文传给 Qwen 规划；超出长度时先丢弃最早的消息，当前任务不会被截断。
-- 输入组合选择，按合成、真实观测、上传标注来源；真实观测显示两景的时相、极化和轨道。也可以在页面上传自己的前后 GeoTIFF。
-- 阶段进度：排队、启动、发现工具、模型规划、成功链（含当前工具和序号）、拒绝链、整理证据、完成。
+- 分析数据以卡片显示前期、后期影像缩略图、标题、地点、时间、传感器和范围；默认只列卫星观测和用户上传的数据，合成测试栅格和测试上传归为“开发者数据”，勾选后才显示。
+- 运行前核对数据：页面把任务描述交给本机 Qwen 识别其中提到的地点或事件（见下文），与当前选择不一致时提示改用对应数据；提到的地点不在现有数据中时提示上传。
+- 阶段进度：排队、启动、发现工具、模型规划、执行分析（含当前工具和序号）、门控自检（仅勾选时）、整理证据、完成。
+- 影像与水体：前期、后期影像和由阈值得到的两期水体（SAR 输入），或两期水体标签（标签输入）。
 - Qwen 实际使用的模型与降级信息，以及模型规划出的工具顺序和中文说明。
 - 每个工具步骤可以展开查看输入、输出摘要、execution ID、trace ID 和 manifest 内容。
-- 输入尺寸或空间范围不一致时的 `shape_mismatch` 拒绝链。
+- 门控自检（可选）：勾选“同时运行门控自检”后，用数据附带的、故意做成尺寸不一致的 `mismatch.tif` 再做一次网格检查，预期被 `shape_mismatch` 拦截。默认不运行；成功链中的门控始终生效。
 - 运行历史。已完成的运行来自 runner 写入的摘要文件，可重新打开；当前进程内失败的任务也会列出原因。
 - 水体统计卡片：有效面积，前期、后期、新增、消退水体面积；SAR 输入还会显示所用的 dB 阈值。
 
 ## 输入组合
 
-输入组合来自两个目录，每个目录必须包含 `before.tif` 和 `after.tif`，`mismatch.tif` 可选（没有时不运行拒绝链）。目录中的 `fixture.json` 说明输入类型和来源；没有这个文件的 `demo-fixtures/` 根目录按合成 0/1 水体标签处理。
+输入组合来自两个目录，每个目录必须包含 `before.tif` 和 `after.tif`，`mismatch.tif` 可选（只用于门控自检）。目录中的 `fixture.json` 说明输入类型和来源；没有这个文件的 `demo-fixtures/` 根目录按合成 0/1 水体标签处理。
 
 | 来源 | 位置 | 说明 |
 | --- | --- | --- |
@@ -109,6 +111,9 @@ Flow 列表和删除直接调用 Terraflow 的 `/api/v1/flows/`；删除后同�
 | GET | `/api/water-demo/health` | 服务状态和当前是否有任务在运行 |
 | GET | `/api/water-demo/fixtures` | 可选输入组合，含来源、输入类型和影像时相 |
 | POST | `/api/water-demo/uploads` | 新建上传，body 为 `{label, input_kind, input_scale}` |
+| POST | `/api/water-demo/resolve-input` | body `{prompt, current}`；本机 Qwen 识别任务里提到的数据，返回 `input_set`、`mentioned`、`unmatched` |
+| GET | `/api/water-demo/input-sets/{id}/preview/{before\|after\|mismatch}` | 输入影像的 PNG 预览 |
+| GET | `/api/water-demo/runs/{run_id}/preview/{before\|after\|before_mask\|after_mask}` | 一次运行的影像与水体预览 |
 | PUT | `/api/water-demo/uploads/{upload_id}/{before\|after\|mismatch}` | 上传单个 GeoTIFF 原始字节，单个不超过 64 MB，只接受 TIFF 文件头 |
 | POST | `/api/water-demo/uploads/{upload_id}/finalize` | 检查坐标参考系和单波段，通过后加入输入组合 |
 | POST | `/api/water-demo/run` | 提交任务，body 为 `{prompt, fixture_id, messages}`，返回 `202` 和 `job_id`；已有任务运行时返回 `409` |
@@ -152,6 +157,14 @@ flow 里的节点都是真实组件：
 | Tool Result Field | 同上 | 从 Terrabox 工具结果中取出 `outputs.output_path`、`outputs.threshold` 等字段，交给下一个工具 |
 | Inspect GeoTIFF、Raster Profile Preflight、Threshold Segmentation、Raster Difference、Water Label Evidence、Pixel → Area | Terrabox 自动生成的组件 | 与 runner 调用的是同一组 Terrabox 工具 |
 
-SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu，求出的阈值经 Tool Result Field 传给前期影像，与 runner 的规则一致。输入组合含 `mismatch.tif` 时，flow 另有一条拒绝分支，其中的 Water Label Evidence 在门控拦截后不会执行。
+SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu，求出的阈值经 Tool Result Field 传给前期影像，与 runner 的规则一致。只有做过门控自检的运行（或模板加 `--self-check`）生成的 flow 才带拒绝分支，其中的 Water Label Evidence 在门控拦截后不会执行。
 
 后端需要设置 `TERRAFLOW_WATER_RUNTIME_DIR`（Water Input Set 用它列出输入组合）。新组件已写入 `src/lfx/src/lfx/_assets/component_index.json`，生产模式无需 `LFX_DEV`。
+
+## 影像预览与数据识别
+
+预览由 `scripts/render_raster_preview.py` 在 Terrabox geo 环境中渲染：SAR 转为 dB 后按 −25～0 dB 拉伸为灰度，0/1 标签中水体为蓝色、非水体为灰色，无效像素透明；只渲染 runtime 目录内的文件，按文件路径、修改时间和大小缓存在 `runtime/previews/`。
+
+数据识别调用本机 Qwen3.5-4B，要求它原文摘出任务中提到的地点、事件或数据类型。适配层只在摘出的文字确实出现在任务中、且与所选数据的标题、地点或事件有重合时才采用；否则视为“没有提到具体数据”，沿用当前选择。任务中出现“合成”或 “synthetic” 时直接对应合成测试栅格。识别结果和用户的选择（改用、沿用、未提及）记录在运行摘要的 `web_request.input_resolution`。
+
+数据卡片的标题、地点、传感器和类别来自 `fixture.json` 的 `title`、`place`、`sensor`、`category`；`category` 为 `synthetic` 或 `test` 的数据归为开发者数据。

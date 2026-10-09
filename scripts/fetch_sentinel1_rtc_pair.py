@@ -111,6 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--label", required=True, help="Short label shown in the web fixture list")
     parser.add_argument("--event", required=True, help="Event description recorded in fixture.json")
+    parser.add_argument("--title", help="User-facing title, e.g. place and event")
+    parser.add_argument("--place", help="User-facing place description")
     return parser
 
 
@@ -158,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": "terraflow-water-fixture.v1",
         "type": "sentinel1_rtc_gamma0",
         "input_kind": "sar_backscatter",
+        "category": "observed",
         "label": args.label,
+        "title": args.title or args.label,
+        "place": args.place,
+        "sensor": f"Sentinel-1 SAR（{args.polarization.upper()}）",
         "description": f"{before_scene['datetime'][:10]} / {after_scene['datetime'][:10]} Sentinel-1 RTC {args.polarization.upper()}，同轨道 {before_scene['relative_orbit']}（{before_scene['orbit_state']}）",
         "input_scale": "linear",
         "event": args.event,

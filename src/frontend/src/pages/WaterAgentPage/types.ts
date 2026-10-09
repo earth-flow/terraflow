@@ -9,6 +9,7 @@ export type SceneInfo = {
 export type FixtureInfo = {
   type?: string;
   label?: string;
+  title?: string;
   description?: string;
   input_kind?: string;
   event?: string;
@@ -20,9 +21,24 @@ export type FixtureInfo = {
 export type FixtureOption = FixtureInfo & {
   id: string;
   label: string;
+  title: string;
   description: string;
   source: "synthetic" | "observed" | "uploaded";
+  category: "synthetic" | "observed" | "uploaded" | "test" | string;
+  audience: "user" | "developer";
+  place?: string | null;
+  period?: string | null;
+  sensor?: string;
+  area_km2?: number | null;
+  previews?: { before?: string; after?: string };
   has_mismatch?: boolean;
+};
+
+export const CATEGORY_LABELS: Record<string, string> = {
+  observed: "卫星观测",
+  uploaded: "我的上传",
+  synthetic: "合成测试",
+  test: "测试上传",
 };
 
 export type HistoryItem = {

@@ -3,11 +3,12 @@ import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "./api";
 import DataPanel from "./DataPanel";
+import DatasetPicker from "./DatasetPicker";
 import FlowsPanel from "./FlowsPanel";
 import HistoryPanel from "./HistoryPanel";
 import ToolsPanel from "./ToolsPanel";
 import type { FixtureInfo, FixtureOption, HistoryItem } from "./types";
-import { SOURCE_LABELS, sceneLine } from "./types";
+import { sceneLine } from "./types";
 
 type RunStatus = "idle" | "running" | "complete" | "error";
 type Step = {
@@ -107,6 +108,13 @@ type ApiResponse = {
   error?: string;
   evidence?: Evidence;
 };
+type InputResolution = {
+  input_set?: string | null;
+  mentioned?: string | null;
+  unmatched?: boolean;
+  reason?: string;
+  model?: string;
+};
 type Message = {
   id: string;
   role: "user" | "assistant";
@@ -131,8 +139,8 @@ const STAGES = [
   { id: "starting", label: "启动 runner" },
   { id: "discovering", label: "发现工具" },
   { id: "planning", label: "模型规划" },
-  { id: "executing_success", label: "成功链" },
-  { id: "executing_rejection", label: "拒绝链" },
+  { id: "executing_success", label: "执行分析" },
+  { id: "executing_rejection", label: "门控自检" },
   { id: "recording", label: "整理证据" },
   { id: "complete", label: "完成" },
 ];
@@ -179,16 +187,14 @@ function assistantReply(summary: DemoSummary) {
   const lines: string[] = [];
   if (success?.status === "blocked_by_gate") {
     lines.push(
-      "成功链在 " +
+      "分析在 " +
         displayTool(success.blocked_tool ?? "gate") +
         " 被门控拦截（" +
         (success.reason_code ?? "未知原因") +
         "），后续工具没有执行。",
     );
   } else {
-    lines.push(
-      "已执行 " + (success?.steps?.length ?? 0) + " 次成功链工具调用。",
-    );
+    lines.push("已执行 " + (success?.steps?.length ?? 0) + " 次工具调用。");
     const stats = waterStats(summary);
     if (stats)
       lines.push(
@@ -201,9 +207,11 @@ function assistantReply(summary: DemoSummary) {
   }
   const rejection = summary.rejection_chain;
   if (rejection?.status === "not_run")
-    lines.push("这组输入没有拒绝样本，未运行拒绝链。");
+    lines.push("这组数据没有自检样本，未运行门控自检。");
   else if (rejection?.reason_code)
-    lines.push("拒绝样本被门控拦截（" + rejection.reason_code + "）。");
+    lines.push(
+      "门控自检：故意不一致的样本被拦截（" + rejection.reason_code + "）。",
+    );
   return (reason ? reason + "\n\n" : "") + lines.join("");
 }
 
@@ -220,6 +228,12 @@ export default function WaterAgentPage() {
   const [fixtureId, setFixtureId] = useState("demo-fixtures");
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
   const [canvasState, setCanvasState] = useState("");
+  const [selfCheck, setSelfCheck] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [pendingChoice, setPendingChoice] = useState<{
+    prompt: string;
+    resolution: InputResolution;
+  } | null>(null);
   const [section, setSection] = useState<Section>("chat");
 
   async function openCanvas(runId: string) {
@@ -254,8 +268,11 @@ export default function WaterAgentPage() {
   const rejectionSteps = result?.rejection_chain?.steps ?? [];
   const allSteps = useMemo(
     () => [
-      ...successSteps.map((step) => ({ ...step, chain: "成功链" as const })),
-      ...rejectionSteps.map((step) => ({ ...step, chain: "拒绝链" as const })),
+      ...successSteps.map((step) => ({ ...step, chain: "分析" as const })),
+      ...rejectionSteps.map((step) => ({
+        ...step,
+        chain: "门控自检" as const,
+      })),
     ],
     [successSteps, rejectionSteps],
   );
@@ -287,8 +304,11 @@ export default function WaterAgentPage() {
       .then(([fixtureBody, historyBody]) => {
         if (Array.isArray(fixtureBody.fixtures)) {
           setFixtures(fixtureBody.fixtures);
-          if (fixtureBody.fixtures[0]?.id)
-            setFixtureId(fixtureBody.fixtures[0].id);
+          const preferred =
+            fixtureBody.fixtures.find(
+              (item: FixtureOption) => item.audience !== "developer",
+            ) ?? fixtureBody.fixtures[0];
+          if (preferred?.id) setFixtureId(preferred.id);
         }
         if (Array.isArray(historyBody.runs)) setHistory(historyBody.runs);
       })
@@ -366,8 +386,48 @@ export default function WaterAgentPage() {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (status === "running" || !prompt.trim()) return;
-    const currentPrompt = prompt.trim();
+    if (status === "running" || resolving || !prompt.trim()) return;
+    const text = prompt.trim();
+    setPendingChoice(null);
+    setResolving(true);
+    let resolution: InputResolution | null = null;
+    try {
+      const response = await apiFetch("/api/water-demo/resolve-input", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text, current: fixtureId }),
+      });
+      if (response.ok) resolution = (await response.json()) as InputResolution;
+    } catch {
+      // Identification is advisory; run with the current selection if it fails.
+    } finally {
+      setResolving(false);
+    }
+    if (
+      resolution &&
+      ((resolution.input_set && resolution.input_set !== fixtureId) ||
+        resolution.unmatched)
+    ) {
+      setPendingChoice({ prompt: text, resolution });
+      return;
+    }
+    await startRun(
+      text,
+      fixtureId,
+      resolution && {
+        ...resolution,
+        decision: resolution.input_set ? "matched_current" : "no_mention",
+      },
+    );
+  }
+
+  async function startRun(
+    currentPrompt: string,
+    setId: string,
+    resolution: (InputResolution & { decision: string }) | null,
+  ) {
+    setPendingChoice(null);
+    setFixtureId(setId);
     setMessages((current) =>
       current.concat({
         id: String(Date.now()) + "-user",
@@ -381,14 +441,19 @@ export default function WaterAgentPage() {
     setEvidence(null);
     setExpandedStep(null);
     setJob(null);
+    const runSelfCheck =
+      selfCheck &&
+      Boolean(fixtures.find((item) => item.id === setId)?.has_mismatch);
     try {
       const response = await apiFetch("/api/water-demo/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: currentPrompt,
-          fixture_id: fixtureId,
+          fixture_id: setId,
           messages,
+          self_check: runSelfCheck,
+          input_resolution: resolution,
         }),
       });
       const body = (await response.json()) as ApiResponse;
@@ -416,6 +481,9 @@ export default function WaterAgentPage() {
     }
   }
 
+  const titleOf = (id?: string | null) =>
+    fixtures.find((item) => item.id === id)?.title ?? id ?? "—";
+
   const progress = job
     ? Math.round(
         ((stageIndex(job.stage) +
@@ -437,9 +505,9 @@ export default function WaterAgentPage() {
       >
         <div className="hidden px-2 pb-3 md:block">
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-            地学 Agent 工作区
+            Agent Workspace
           </p>
-          <p className="mt-1 text-sm font-semibold">场景：水体变化分析</p>
+          <p className="mt-1 text-sm font-semibold">Water Change</p>
         </div>
         {SECTIONS.map((item) => (
           <button
@@ -490,13 +558,14 @@ export default function WaterAgentPage() {
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
                     <p className="mb-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-                      地学 Agent 工作区 · 水体变化分析
+                      Agent Workspace · Water Change
                     </p>
                     <h1 className="text-2xl font-semibold tracking-tight">
                       水体变化分析
                     </h1>
                     <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                      用自然语言提交任务。每次运行都会保留模型规划、工具步骤、拒绝原因和证据索引；上一轮对话会作为下一轮任务的上下文。
+                      用自然语言描述要分析的区域和问题。Agent
+                      会核对任务里提到的数据，规划并执行工具，每一步都保留可复查的证据；上一轮对话会作为下一轮的上下文。
                     </p>
                   </div>
                   <span className="water-agent-status rounded-full border px-3 py-1 text-xs font-medium">
@@ -504,7 +573,7 @@ export default function WaterAgentPage() {
                   </span>
                 </div>
                 <form onSubmit={submit} className="mt-6">
-                  <div className="grid gap-4 md:grid-cols-[1fr_18rem]">
+                  <div className="space-y-4">
                     <div>
                       <label
                         htmlFor="water-agent-prompt"
@@ -519,80 +588,130 @@ export default function WaterAgentPage() {
                         rows={3}
                         maxLength={1200}
                         className="w-full resize-y rounded-xl border border-input bg-background px-4 py-3 text-sm leading-6 outline-none transition focus:ring-2 focus:ring-ring"
-                        placeholder="例如：检查前后栅格中的水体变化，并说明哪些检查阻止了不一致输入继续执行。"
+                        placeholder="例如：看看希腊色萨利 2023 年 9 月那次洪水，新增了多少水面？"
                       />
                     </div>
-                    <div>
-                      <label
-                        htmlFor="water-agent-fixture"
-                        className="mb-2 block text-sm font-medium"
-                      >
-                        输入组合
-                      </label>
-                      <select
-                        id="water-agent-fixture"
-                        value={fixtureId}
-                        onChange={(event) => setFixtureId(event.target.value)}
-                        className="w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-ring"
-                        disabled={status === "running"}
-                      >
-                        {fixtures.map((fixture) => (
-                          <option key={fixture.id} value={fixture.id}>
-                            [{SOURCE_LABELS[fixture.source] ?? fixture.source}]{" "}
-                            {fixture.label}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="mt-2 space-y-1 text-xs leading-5 text-muted-foreground">
-                        <p>
-                          {selectedFixture?.description ||
-                            "当前服务未返回可用输入组合。"}
-                        </p>
-                        {selectedFixture?.source === "observed" && (
-                          <>
-                            {sceneLine(
-                              "前期",
-                              selectedFixture.scenes?.before,
-                            ) && (
-                              <p>
-                                {sceneLine(
-                                  "前期",
-                                  selectedFixture.scenes?.before,
-                                )}
-                              </p>
-                            )}
-                            {sceneLine(
-                              "后期",
-                              selectedFixture.scenes?.after,
-                            ) && (
-                              <p>
-                                {sceneLine(
-                                  "后期",
-                                  selectedFixture.scenes?.after,
-                                )}
-                              </p>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    </div>
+                    <DatasetPicker
+                      fixtures={fixtures}
+                      value={fixtureId}
+                      disabled={status === "running"}
+                      onChange={(id) => {
+                        setFixtureId(id);
+                        setPendingChoice(null);
+                      }}
+                    />
                   </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                     <p className="max-w-3xl text-xs leading-5 text-muted-foreground">
-                      {selectedFixture?.source === "observed"
-                        ? "真实 Sentinel-1 观测。水体掩膜由后向散射阈值估计得到，不是参考标注；前后差异本身不能证明洪水因果。"
-                        : selectedFixture?.source === "uploaded"
-                          ? "用户上传的数据，来源、时相和标签未经系统核实。"
-                          : "可审计的合成工程栅格，只用于检查工具链；结果不解释为洪水因果。"}
+                      {selectedFixture?.category === "observed"
+                        ? "卫星观测数据。水体由后向散射阈值估计得到，不是参考标注；前后差异本身不能证明洪水成因。"
+                        : selectedFixture?.category === "uploaded" ||
+                            selectedFixture?.category === "test"
+                          ? "上传的数据，来源、时间和标签未经系统核实。"
+                          : "合成测试栅格，只用于检查工具链，结果没有实际意义。"}
                     </p>
-                    <Button
-                      type="submit"
-                      disabled={status === "running" || !prompt.trim()}
-                    >
-                      {status === "running" ? "执行中…" : "运行水体 Agent"}
-                    </Button>
+                    <div className="flex flex-wrap items-center gap-3">
+                      {selectedFixture?.has_mismatch && (
+                        <label
+                          className="flex items-center gap-2 text-xs text-muted-foreground"
+                          title="用这组数据附带的、故意做成尺寸不一致的样本再跑一次网格检查，确认门控会拦截"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selfCheck}
+                            onChange={(event) =>
+                              setSelfCheck(event.target.checked)
+                            }
+                            disabled={status === "running"}
+                          />
+                          同时运行门控自检
+                        </label>
+                      )}
+                      <Button
+                        type="submit"
+                        disabled={
+                          status === "running" || resolving || !prompt.trim()
+                        }
+                      >
+                        {resolving
+                          ? "正在核对数据…"
+                          : status === "running"
+                            ? "执行中…"
+                            : "运行"}
+                      </Button>
+                    </div>
                   </div>
                 </form>
+                {pendingChoice && (
+                  <div className="water-agent-rejection mt-5 rounded-xl p-4 text-sm leading-6">
+                    {pendingChoice.resolution.input_set ? (
+                      <p>
+                        任务中提到「{pendingChoice.resolution.mentioned}
+                        」，对应数据「
+                        {titleOf(pendingChoice.resolution.input_set)}
+                        」；当前选择的是「
+                        {titleOf(fixtureId)}」。
+                      </p>
+                    ) : (
+                      <p>
+                        任务中提到的「{pendingChoice.resolution.mentioned}
+                        」不在现有数据中。可以先到“数据”里上传对应影像，或者用当前选择的「
+                        {titleOf(fixtureId)}」继续。
+                      </p>
+                    )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {pendingChoice.resolution.input_set && (
+                        <Button
+                          type="button"
+                          onClick={() =>
+                            void startRun(
+                              pendingChoice.prompt,
+                              pendingChoice.resolution.input_set!,
+                              {
+                                ...pendingChoice.resolution,
+                                decision: "switched",
+                              },
+                            )
+                          }
+                        >
+                          改用「{titleOf(pendingChoice.resolution.input_set)}
+                          」并运行
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() =>
+                          void startRun(pendingChoice.prompt, fixtureId, {
+                            ...pendingChoice.resolution,
+                            decision: "kept_current",
+                          })
+                        }
+                      >
+                        仍用当前数据运行
+                      </Button>
+                      {!pendingChoice.resolution.input_set && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => {
+                            setPendingChoice(null);
+                            setSection("data");
+                          }}
+                        >
+                          去上传数据
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={() => setPendingChoice(null)}
+                      >
+                        取消
+                      </Button>
+                    </div>
+                  </div>
+                )}
                 {status === "running" && job && (
                   <div className="water-agent-progress mt-5 rounded-xl border border-border bg-muted/30 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -743,7 +862,7 @@ export default function WaterAgentPage() {
                   </section>
                   {result.success_chain?.status === "blocked_by_gate" && (
                     <section className="water-agent-rejection rounded-xl p-4 text-sm leading-6">
-                      <p className="font-medium">成功链被科学门控拦截</p>
+                      <p className="font-medium">分析在门控处被拦截</p>
                       <p className="mt-1 text-muted-foreground">
                         {displayTool(
                           result.success_chain.blocked_tool ?? "gate",
@@ -755,6 +874,52 @@ export default function WaterAgentPage() {
                             result.success_chain.failed_checks.join("、")
                           : ""}
                       </p>
+                    </section>
+                  )}
+                  {result.fixtures?.before && (
+                    <section className="rounded-2xl border border-border bg-card p-5">
+                      <div className="flex flex-wrap items-baseline justify-between gap-2">
+                        <h2 className="font-semibold">影像与水体</h2>
+                        <p className="text-xs text-muted-foreground">
+                          蓝色为水体，灰色为非水体，透明为无效像素
+                          {result.fixtures?.input_kind === "sar_backscatter"
+                            ? "；水体由阈值估计得到"
+                            : ""}
+                        </p>
+                      </div>
+                      <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+                        {(result.fixtures?.input_kind === "sar_backscatter"
+                          ? [
+                              ["before", "前期影像"],
+                              ["after", "后期影像"],
+                              ["before_mask", "前期水体"],
+                              ["after_mask", "后期水体"],
+                            ]
+                          : [
+                              ["before", "前期水体标签"],
+                              ["after", "后期水体标签"],
+                            ]
+                        ).map(([name, caption]) => (
+                          <figure key={name} className="min-w-0">
+                            <div className="water-agent-thumb aspect-square overflow-hidden rounded-xl">
+                              <img
+                                src={
+                                  "/api/water-demo/runs/" +
+                                  encodeURIComponent(result.run_id) +
+                                  "/preview/" +
+                                  name
+                                }
+                                alt={caption}
+                                loading="lazy"
+                                className="h-full w-full object-cover [image-rendering:pixelated]"
+                              />
+                            </div>
+                            <figcaption className="mt-1 text-center text-xs text-muted-foreground">
+                              {caption}
+                            </figcaption>
+                          </figure>
+                        ))}
+                      </div>
                     </section>
                   )}
                   {stats && (
@@ -923,27 +1088,29 @@ export default function WaterAgentPage() {
                         {result.plan?.reason ||
                           "模型返回了可执行的工具顺序，页面保留原始执行证据供复核。"}
                       </p>
-                      <div className="water-agent-rejection mt-5 rounded-xl p-4 text-sm leading-6">
-                        <p className="font-medium">拒绝链</p>
-                        <p className="mt-1 text-muted-foreground">
-                          {result.rejection_chain?.status === "not_run"
-                            ? "这组输入没有拒绝样本，未运行拒绝链。"
-                            : result.rejection_chain?.reason_code
-                              ? "输入不一致时已停止下游调用（" +
-                                result.rejection_chain.reason_code +
-                                "）。"
-                              : "本次未返回拒绝原因。"}
-                        </p>
-                        {result.rejection_chain?.failed_checks && (
-                          <p className="mt-2 text-xs text-muted-foreground">
-                            检查项：
-                            {result.rejection_chain.failed_checks.join("、")}
+                      {result.rejection_chain?.status ===
+                        "deterministic_refusal" && (
+                        <div className="water-agent-rejection mt-5 rounded-xl p-4 text-sm leading-6">
+                          <p className="font-medium">门控自检</p>
+                          <p className="mt-1 text-muted-foreground">
+                            用故意做成尺寸不一致的样本再做一次网格检查，门控按预期拦截（
+                            {result.rejection_chain.reason_code}
+                            ），后续工具没有执行。
                           </p>
-                        )}
-                      </div>
+                          {result.rejection_chain.failed_checks && (
+                            <p className="mt-2 text-xs text-muted-foreground">
+                              检查项：
+                              {result.rejection_chain.failed_checks.join("、")}
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <div className="mt-4 space-y-1 rounded-xl bg-muted/60 p-4 text-xs leading-5 text-muted-foreground">
                         <p className="font-medium text-foreground">
-                          输入：{result.fixtures?.label ?? "—"}
+                          数据：
+                          {result.fixtures?.title ??
+                            result.fixtures?.label ??
+                            "—"}
                         </p>
                         {result.fixtures?.event && (
                           <p>事件：{result.fixtures.event}</p>

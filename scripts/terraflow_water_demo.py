@@ -632,8 +632,16 @@ def run_rejection_chain(
     mismatch: str | None,
     model_state: dict[str, Any],
     fixture_meta: dict[str, Any],
+    self_check: bool = False,
     progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    if not self_check:
+        return {
+            "status": "not_requested",
+            "fixture_type": fixture_meta["type"],
+            "reason": "gate self-check not requested",
+            "steps": [],
+        }
     if mismatch is None:
         return {
             "status": "not_run",
@@ -700,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requested-weight", type=Path, default=Path(DEFAULT_REQUESTED_WEIGHT))
     parser.add_argument("--fallback-weight", type=Path, default=Path(DEFAULT_FALLBACK_WEIGHT))
     parser.add_argument("--prompt", help="Natural-language task sent to the model planner")
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Also run the gate self-check: preflight on the deliberately mismatched raster, expecting a refusal",
+    )
     parser.add_argument(
         "--progress-file",
         type=Path,
@@ -772,6 +785,7 @@ def main(argv: list[str] | None = None) -> int:
             mismatch=mismatch,
             model_state=model_state,
             fixture_meta=fixture_meta,
+            self_check=args.self_check,
             progress_cb=lambda stage, message, current, total, tool: write_progress(
                 progress_path, stage, message, current, total, tool
             ),
