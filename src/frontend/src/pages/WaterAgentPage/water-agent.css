@@ -50,3 +50,17 @@
   border: 1px solid hsl(var(--border));
   background: hsl(var(--muted) / 0.35);
 }
+.water-agent-nav {
+  background: hsl(var(--card) / 0.6);
+}
+.water-agent-nav-item {
+  color: hsl(var(--foreground));
+  transition: background 120ms ease;
+}
+.water-agent-nav-item:hover {
+  background: hsl(var(--muted) / 0.7);
+}
+.water-agent-nav-item-active {
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+}

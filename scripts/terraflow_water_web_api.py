@@ -9,6 +9,7 @@ job/status/history/evidence API and GeoTIFF upload for the custom page.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -339,18 +340,110 @@ def finalize_upload(upload_id: str) -> tuple[int, dict[str, Any]]:
     return 200, {"status": "ready", "fixture": fixture_option(f"upload-{upload_id}", directory, meta)}
 
 
+def _load_runner() -> Any:
+    """Import the CLI runner (standard library only) for its catalog and presets."""
+    spec = importlib.util.spec_from_file_location("terraflow_water_demo", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_RUNNER = _load_runner()
+_TOOLS_CACHE: dict[str, Any] = {}
+TOOLS_CACHE_SECONDS = 30
+
+
+def tool_catalog() -> tuple[int, dict[str, Any]]:
+    """Live Terrabox catalog plus the water scenario presets, cached briefly."""
+    cached = _TOOLS_CACHE.get("value")
+    if cached and time.monotonic() - _TOOLS_CACHE.get("at", 0) < TOOLS_CACHE_SECONDS:
+        return 200, cached
+    try:
+        api_key = _RUNNER.load_api_key(Path("/tmp/terrabox-api-key"), None)
+        toolkits, tools = _RUNNER.discover_catalog(_RUNNER.DEFAULT_TERRABOX_URL, api_key)
+    except _RUNNER.DemoError as exc:
+        return 502, {"status": "error", "error": f"无法读取 Terrabox 工具目录：{exc}"}
+    core = set(_RUNNER.CORE_TOOL_SLUGS)
+    tool_rows = [
+        {
+            "slug": slug,
+            "name": spec.get("name"),
+            "toolkit": spec.get("toolkit_slug"),
+            "status": spec.get("status"),
+            "toolkit_status": spec.get("toolkit_status"),
+            "description": str(spec.get("description") or "")[:300],
+            "water_chain": slug in core,
+        }
+        for slug, spec in sorted(tools.items())
+    ]
+    toolkit_rows = []
+    for toolkit in toolkits:
+        slug = str(toolkit.get("slug") or toolkit.get("name"))
+        rows = [row for row in tool_rows if row["toolkit"] == slug]
+        toolkit_rows.append(
+            {
+                "slug": slug,
+                "name": toolkit.get("name"),
+                "status": toolkit.get("status"),
+                "description": str(toolkit.get("description") or "")[:300],
+                "tool_count": len(rows),
+                "available_count": sum(1 for row in rows if row["status"] == "available"),
+            }
+        )
+    payload = {
+        "status": "ok",
+        "fetched_at": utc_now(),
+        "toolkits": toolkit_rows,
+        "tools": tool_rows,
+        "water_chain_tools": list(_RUNNER.CORE_TOOL_SLUGS),
+        "scenarios": _RUNNER.SCENARIOS,
+    }
+    _TOOLS_CACHE.update(value=payload, at=time.monotonic())
+    return 200, payload
+
+
+def _read_canvas_index() -> dict[str, Any]:
+    index = read_json(CANVAS_INDEX)
+    return index if isinstance(index, dict) else {}
+
+
+def canvas_index() -> dict[str, Any]:
+    """Flow ids keyed by run id or ``template:<input set>``."""
+    with _CANVAS_LOCK:
+        return {"status": "ok", "flows": _read_canvas_index()}
+
+
+def forget_canvas_flow(flow_id: str) -> tuple[int, dict[str, Any]]:
+    """Drop index entries for a flow the user deleted in Terraflow."""
+    with _CANVAS_LOCK:
+        index = _read_canvas_index()
+        kept = {key: entry for key, entry in index.items() if entry.get("flow_id") != flow_id}
+        CANVAS_INDEX.write_text(json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 200, {"status": "ok", "removed": len(index) - len(kept)}
+
+
 def canvas_flow_for_run(run_id: str, *, force: bool = False) -> tuple[int, dict[str, Any]]:
     """Create (once) a Terraflow canvas flow from a run's validated plan."""
     if summary_path_for(run_id) is None:
         return 404, {"status": "not_found", "error": "运行记录不存在"}
+    return _build_canvas_flow(run_id, ["--run-id", run_id], force=force)
+
+
+def canvas_flow_for_input_set(set_id: str, *, force: bool = False) -> tuple[int, dict[str, Any]]:
+    """Create (once) a template canvas flow for an input set."""
+    if resolve_fixture(set_id) is None:
+        return 404, {"status": "not_found", "error": "输入组合不存在"}
+    return _build_canvas_flow(f"template:{set_id}", ["--input-set", set_id], force=force)
+
+
+def _build_canvas_flow(key: str, source_args: list[str], *, force: bool) -> tuple[int, dict[str, Any]]:
     with _CANVAS_LOCK:
-        index = read_json(CANVAS_INDEX)
-        index = index if isinstance(index, dict) else {}
-        if run_id in index and not force:
-            return 200, {"status": "exists", **index[run_id]}
+        index = _read_canvas_index()
+        if key in index and not force:
+            return 200, {"status": "exists", **index[key]}
         try:
             completed = subprocess.run(
-                [FLOW_PYTHON, str(FLOW_BUILDER), "--run-id", run_id, "--runtime-dir", str(RUNTIME_DIR)],
+                [FLOW_PYTHON, str(FLOW_BUILDER), *source_args, "--runtime-dir", str(RUNTIME_DIR)],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
@@ -370,9 +463,11 @@ def canvas_flow_for_run(run_id: str, *, force: bool = False) -> tuple[int, dict[
             "flow_id": result["flow_id"],
             "canvas_path": result["canvas_path"],
             "name": result.get("name"),
+            "input_set": result.get("input_set"),
+            "plan": result.get("plan"),
             "created_at": utc_now(),
         }
-        index[run_id] = entry
+        index[key] = entry
         CANVAS_INDEX.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
         return 201, {"status": "created", **entry}
 
@@ -608,7 +703,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -626,6 +721,12 @@ class Handler(BaseHTTPRequestHandler):
                     "active_job_id": active,
                 },
             )
+            return
+        if path == "/api/water-demo/tools":
+            self._send(*tool_catalog())
+            return
+        if path == "/api/water-demo/canvas-flows":
+            self._send(200, canvas_index())
             return
         if path == "/api/water-demo/fixtures":
             self._send(200, {"status": "ok", "fixtures": fixture_options()})
@@ -669,6 +770,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload if isinstance(payload, dict) else None
 
+    def do_DELETE(self) -> None:
+        parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
+        if len(parts) == 4 and parts[:3] == ["api", "water-demo", "canvas-flows"] and _SAFE_ID.fullmatch(parts[3]):
+            self._send(*forget_canvas_flow(parts[3]))
+            return
+        self._send(404, {"status": "not_found", "error": "unknown endpoint"})
+
     def do_PUT(self) -> None:
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
         if len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]:
@@ -697,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "uploads"] and parts[4] == "finalize":
             self._send(*finalize_upload(parts[3]))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "canvas":
+            force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
+            self._send(*canvas_flow_for_input_set(parts[3], force=force))
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "canvas":
             force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"

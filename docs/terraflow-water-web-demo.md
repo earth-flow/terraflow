@@ -34,6 +34,20 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 然后访问 [http://127.0.0.1:14173/water-agent](http://127.0.0.1:14173/water-agent)。
 
+## 工作区分区
+
+页面左侧（窄屏时在顶部）分为五个区：
+
+| 分区 | 内容 |
+| --- | --- |
+| 对话 | 提交任务、选择输入组合、阶段进度、Agent 回复、水体统计、工具步骤与证据；结果区可“在 Canvas 中打开” |
+| Flow | 水体分析相关的 Terraflow flow（名称以“水体分析”开头），显示来源（某次运行、模板或命令行生成）；可打开 Canvas、删除，或为输入组合生成模板 flow |
+| 工具 | Terrabox 工具集与工具、可用状态、搜索、“只看水体链工具”；场景预设的参数 |
+| 数据 | 输入组合卡片（来源、输入类型、时相、网格），上传入口；“用这组数据对话”切回对话区并选中该组合 |
+| 运行记录 | 最近 50 次运行，可按完成 / 门控拦截 / 失败筛选，打开后在对话区显示 |
+
+Flow 列表和删除直接调用 Terraflow 的 `/api/v1/flows/`；删除后同时清理适配层里的运行与 flow 对应记录。
+
 ## 页面能展示什么
 
 - 会话消息列表。每次提交时，最近 6 条消息会作为上下文传给 Qwen 规划；超出长度时先丢弃最早的消息，当前任务不会被截断。
@@ -100,6 +114,10 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 | POST | `/api/water-demo/run` | 提交任务，body 为 `{prompt, fixture_id, messages}`，返回 `202` 和 `job_id`；已有任务运行时返回 `409` |
 | GET | `/api/water-demo/jobs/{job_id}` | 任务阶段、当前工具和完成后的运行摘要 |
 | GET | `/api/water-demo/history?limit=N` | 运行历史 |
+| GET | `/api/water-demo/tools` | Terrabox 工具目录（缓存 30 秒）、水体链工具和场景预设 |
+| GET | `/api/water-demo/canvas-flows` | 运行或模板（`template:<输入组合>`）与 flow 的对应关系 |
+| POST | `/api/water-demo/input-sets/{id}/canvas` | 为输入组合生成模板 flow（每个组合一次，`?force=1` 重新生成） |
+| DELETE | `/api/water-demo/canvas-flows/{flow_id}` | 删除 flow 后清理对应关系 |
 | GET | `/api/water-demo/runs/{run_id}` | 单次运行摘要 |
 | GET | `/api/water-demo/runs/{run_id}/evidence` | 每个步骤的输入、输出、manifest 内容和 execution history 匹配情况 |
 
