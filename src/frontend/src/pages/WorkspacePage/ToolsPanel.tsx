@@ -9,7 +9,7 @@ type ToolRow = {
   status?: string;
   toolkit_status?: string;
   description?: string;
-  water_chain?: boolean;
+  scenarios?: string[];
 };
 type ToolkitRow = {
   slug: string;
@@ -23,8 +23,8 @@ type Catalog = {
   fetched_at?: string;
   toolkits: ToolkitRow[];
   tools: ToolRow[];
-  water_chain_tools: string[];
-  scenarios: Record<string, { derive_labels?: Record<string, unknown> | null }>;
+  scenario_count: number;
+  presets: Record<string, { derive_labels?: Record<string, unknown> | null }>;
 };
 
 export default function ToolsPanel() {
@@ -35,7 +35,7 @@ export default function ToolsPanel() {
   const [openToolkit, setOpenToolkit] = useState<string | null>(null);
 
   useEffect(() => {
-    apiFetch("/api/water-demo/tools")
+    apiFetch("/api/workspace/tools")
       .then(async (response) => {
         const body = (await response.json()) as Catalog & { error?: string };
         if (!response.ok) throw new Error(body.error || "工具目录读取失败。");
@@ -50,7 +50,7 @@ export default function ToolsPanel() {
     const text = query.trim().toLowerCase();
     return (catalog?.tools ?? []).filter(
       (tool) =>
-        (!onlyWater || tool.water_chain) &&
+        (!onlyWater || (tool.scenarios?.length ?? 0) > 0) &&
         (!text ||
           tool.slug.toLowerCase().includes(text) ||
           (tool.name ?? "").toLowerCase().includes(text) ||
@@ -85,7 +85,10 @@ export default function ToolsPanel() {
             ["工具集", catalog.toolkits.length],
             ["工具", catalog.tools.length],
             ["可用", available],
-            ["水体链使用", catalog.water_chain_tools.length],
+            [
+              "场景用到的工具",
+              catalog.tools.filter((tool) => tool.scenarios?.length).length,
+            ],
           ].map(([name, value]) => (
             <div key={name as string} className="rounded-xl bg-muted/50 p-3">
               <p className="text-xs text-muted-foreground">{name}</p>
@@ -99,9 +102,9 @@ export default function ToolsPanel() {
       </div>
 
       <div className="rounded-2xl border border-border bg-card p-5">
-        <h3 className="font-semibold">场景预设</h3>
+        <h3 className="font-semibold">参数预设（按输入类型）</h3>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
-          {Object.entries(catalog.scenarios).map(([kind, scenario]) => (
+          {Object.entries(catalog.presets).map(([kind, scenario]) => (
             <div key={kind} className="min-w-0 rounded-xl bg-muted/40 p-3">
               <p className="text-sm font-medium">
                 {kind === "sar_backscatter" ? "SAR 后向散射" : "0/1 水体标签"}
@@ -134,7 +137,7 @@ export default function ToolsPanel() {
               checked={onlyWater}
               onChange={(event) => setOnlyWater(event.target.checked)}
             />
-            只看水体链工具
+            只看场景用到的工具
           </label>
         </div>
         {searching ? (
@@ -155,7 +158,7 @@ export default function ToolsPanel() {
                       {toolkit.available_count}/{toolkit.tool_count} 可用
                     </span>
                     {toolkit.status !== "active" && (
-                      <span className="water-agent-step-blocked rounded-full px-2 py-0.5 text-xs">
+                      <span className="ws-step-blocked rounded-full px-2 py-0.5 text-xs">
                         {toolkit.status}
                       </span>
                     )}
@@ -195,17 +198,20 @@ function ToolList({ tools }: { tools: ToolRow[] }) {
               className={
                 "rounded-full px-2 py-0.5 text-xs " +
                 (tool.status === "available"
-                  ? "water-agent-step-success"
-                  : "water-agent-step-blocked")
+                  ? "ws-step-success"
+                  : "ws-step-blocked")
               }
             >
               {tool.status === "available" ? "可用" : tool.status}
             </span>
-            {tool.water_chain && (
-              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
-                水体链
+            {tool.scenarios?.map((title) => (
+              <span
+                key={title}
+                className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
+              >
+                {title}
               </span>
-            )}
+            ))}
           </div>
           {tool.description && (
             <p className="mt-1 text-xs leading-5 text-muted-foreground">

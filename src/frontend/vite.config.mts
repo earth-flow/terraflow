@@ -88,6 +88,11 @@ export default defineConfig(({ mode }) => {
       port: port,
       proxy: {
         ...proxyTargets,
+        "^/api/workspace/": {
+          target: env.VITE_WATER_DEMO_API_TARGET || "http://127.0.0.1:7862",
+          changeOrigin: true,
+          secure: false,
+        },
         "^/api/water-demo/": {
           target: env.VITE_WATER_DEMO_API_TARGET || "http://127.0.0.1:7862",
           changeOrigin: true,

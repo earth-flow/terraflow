@@ -1,0 +1,144 @@
+.ws-page {
+  background:
+    radial-gradient(
+      circle at 85% 0%,
+      hsl(var(--primary) / 0.08),
+      transparent 30rem
+    ), hsl(var(--background));
+}
+.ws-status {
+  border-color: hsl(var(--border));
+  background: hsl(var(--muted) / 0.55);
+}
+.ws-step-success {
+  color: var(--success-foreground);
+  background: var(--success-background);
+}
+.ws-step-blocked {
+  color: hsl(var(--warning-foreground));
+  background: hsl(var(--warning) / 0.14);
+}
+.ws-rejection {
+  border: 1px solid hsl(var(--warning) / 0.35);
+  background: hsl(var(--warning) / 0.08);
+}
+.ws-progress-bar {
+  background: hsl(var(--primary));
+  transition: width 240ms ease;
+}
+.ws-stage {
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--muted));
+}
+.ws-stage-active {
+  color: hsl(var(--primary-foreground));
+  background: hsl(var(--primary));
+}
+.ws-message {
+  border-left: 3px solid hsl(var(--border));
+  border-radius: 0.75rem;
+  background: hsl(var(--muted) / 0.35);
+  padding: 0.75rem 1rem;
+}
+.ws-message-user {
+  border-left-color: hsl(var(--primary));
+}
+.ws-detail-button {
+  color: hsl(var(--primary));
+}
+.ws-evidence {
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--muted) / 0.35);
+}
+.ws-nav {
+  background: hsl(var(--card) / 0.6);
+}
+.ws-nav-item {
+  color: hsl(var(--foreground));
+  transition: background 120ms ease;
+}
+.ws-nav-item:hover {
+  background: hsl(var(--muted) / 0.7);
+}
+.ws-nav-item-active {
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+}
+.ws-thumb {
+  background:
+    repeating-conic-gradient(
+      hsl(var(--muted)) 0% 25%,
+      hsl(var(--background)) 0% 50%
+    )
+    50% / 12px 12px;
+}
+.ws-dataset:hover {
+  border-color: hsl(var(--primary) / 0.5);
+}
+.ws-dataset-selected {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 1px hsl(var(--primary) / 0.4);
+}
+.ws-warning {
+  color: hsl(var(--warning-foreground));
+  background: hsl(var(--warning) / 0.14);
+}
+.ws-topbar {
+  background: hsl(var(--background));
+}
+.ws-sidebar {
+  background: hsl(var(--card) / 0.6);
+}
+.ws-bubble-user {
+  color: hsl(var(--primary-foreground));
+  background: hsl(var(--primary));
+}
+.ws-plan {
+  border-color: hsl(var(--primary) / 0.35);
+  background: hsl(var(--primary) / 0.04);
+}
+.ws-chip {
+  color: hsl(var(--primary));
+  background: hsl(var(--primary) / 0.1);
+}
+.ws-dot-running {
+  background: hsl(var(--primary));
+  animation: ws-pulse 1s ease-in-out infinite;
+}
+.ws-dot-done {
+  background: var(--success-foreground);
+}
+.ws-dot-blocked {
+  background: hsl(var(--warning));
+}
+@keyframes ws-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+.ws-markdown p {
+  margin: 0.25rem 0;
+}
+.ws-markdown ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  margin: 0.25rem 0;
+}
+.ws-markdown ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+  margin: 0.25rem 0;
+}
+.ws-markdown strong {
+  font-weight: 600;
+}
+.ws-markdown table {
+  font-size: 0.8rem;
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+}
+.ws-markdown th,
+.ws-markdown td {
+  border: 1px solid hsl(var(--border));
+  padding: 0.2rem 0.5rem;
+}

@@ -1,4 +1,4 @@
-# Terraflow 水体 Agent 网页演示
+# Terraflow Agent Workspace
 
 该演示在 Terraflow 官方 React/TypeScript/Vite 前端中提供一个自定义对话入口。页面提交的自然语言任务会进入同一条水体 runner，后端适配层再调用 Terrabox 和 llama.cpp，并返回工具规划、执行记录、拒绝原因和追踪索引。
 
@@ -34,19 +34,45 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 然后访问 [http://127.0.0.1:14173/workspace](http://127.0.0.1:14173/workspace)。
 
-## 工作区分区
+## 工作区结构（2026-10-09 起）
 
-页面左侧（窄屏时在顶部）分为五个区：
+`/` 默认进入 Agent Workspace（`/workspace`）。它有自己的顶栏和导航，不再嵌在 Langflow 的页面框架中：
 
-| 分区 | 内容 |
-| --- | --- |
-| 对话 | 提交任务、选择输入组合、阶段进度、Agent 回复、水体统计、工具步骤与证据；结果区可“在 Canvas 中打开” |
-| Flow | 水体分析相关的 Terraflow flow（名称以“水体分析”开头），显示来源（某次运行、模板或命令行生成）；可打开 Canvas、删除，或为输入组合生成模板 flow |
-| 工具 | Terrabox 工具集与工具、可用状态、搜索、“只看水体链工具”；场景预设的参数 |
-| 数据 | 输入组合卡片（来源、输入类型、时相、网格），上传入口；“用这组数据对话”切回对话区并选中该组合 |
-| 运行记录 | 最近 50 次运行，可按完成 / 门控拦截 / 失败筛选，打开后在对话区显示 |
+| 页面 | 路径 | 内容 |
+| --- | --- | --- |
+| 对话 | `/workspace`、`/workspace/c/:id` | 左侧会话列表；中间消息流；底部输入框，可用“＋ 添加数据”附加数据集 |
+| 数据 | `/workspace/data` | 数据集卡片、来源、上传；“用这组数据对话”会带着该数据打开对话 |
+| 场景 | `/workspace/scenarios` | 已注册场景的输入、输出、工具和限制 |
+| Flow | `/workspace/flows` | 带 `agent-workspace` 标签的 flow（旧的按名称前缀兼容） |
+| 工具 | `/workspace/tools` | Terrabox 工具目录、可用状态、被哪些场景使用、按输入类型的参数预设 |
+| 运行记录 | `/workspace/runs`、`/workspace/runs/:id` | 历史运行与通用结果详情 |
 
-Flow 列表和删除直接调用 Terraflow 的 `/api/v1/flows/`；删除后同时清理适配层里的运行与 flow 对应记录。
+顶栏的“Canvas 编辑器”进入 Terraflow 原有的 flow 列表（`/flows`）；Langflow 顶栏新增“← 工作区”，左上角图标也回到工作区。
+
+### 一轮对话
+
+1. 用户消息先由规划模型判断：直接回答（基于对话、数据目录、场景说明和上一次结果），还是提出运行。
+2. 提出运行时，先确定数据：附加的数据集、消息中原文提到且与数据描述一致的数据集、或上一次运行用过的数据集；都没有时请用户指定。然后生成计划卡片（场景、数据及其来源、工具顺序、说明），等待用户点“执行”。
+3. 执行时 runner 读取确认过的计划（`--plan-file`，重新校验顺序规则但不重新规划），逐步写事件（`--events-file`）；适配层把阶段和每个工具的开始/完成推送给页面。完成后按场景生成统一结果（标题句、数值、图层与图例、网格检查、门控自检、适用边界），再流式输出一段基于结果的解读。
+4. 回答和解读中的数字会与给定事实核对（允许四舍五入以及比例、百分比和差值），不在其中的会提示“以结果卡片中的数值为准”。
+
+### 场景注册
+
+`scripts/workspace_scenarios.py` 的 `TASK_SCENARIOS` 声明每个场景的输入、要求、输出、工具、限制、示例和结果构建函数。页面只渲染统一结果，新增场景不需要新的前端组件。目前注册了“水体变化”。
+
+### 流式接口
+
+前缀 `/api/workspace`（`/api/water-demo` 保留为别名）。流式接口返回 `text/event-stream`，事件为 `status`、`token`、`step`、`result`、`message`、`error`、`done`，并带 `Cache-Control: no-transform`，以免预览服务器的压缩缓冲。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/scenarios` | 场景目录 |
+| GET/POST | `/conversations` | 会话列表（不含空会话）/ 新建 |
+| GET/DELETE | `/conversations/{id}` | 读取 / 删除会话（不删除运行结果和 flow） |
+| POST | `/conversations/{id}/messages` | 发送消息，流式返回回答或计划 |
+| POST | `/conversations/{id}/plans/{message_id}/execute` | 执行计划（body `{self_check}`），流式返回步骤、结果和解读 |
+| POST | `/conversations/{id}/plans/{message_id}/cancel` | 取消计划 |
+| GET | `/runs/{run_id}/result` | 通用结果 |
 
 ## 页面能展示什么
 

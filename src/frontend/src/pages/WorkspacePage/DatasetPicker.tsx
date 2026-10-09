@@ -49,7 +49,7 @@ export default function DatasetPicker({
             {(["before", "after"] as const).map((role) => (
               <div
                 key={role}
-                className="water-agent-thumb aspect-square min-w-0 flex-1 overflow-hidden rounded-md"
+                className="ws-thumb aspect-square min-w-0 flex-1 overflow-hidden rounded-md"
               >
                 {selected.previews?.[role] && (
                   <img

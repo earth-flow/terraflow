@@ -49,7 +49,7 @@ export default function UploadPanel({
     setFailed(false);
     try {
       setNote("正在创建上传记录…");
-      const created = await apiFetch("/api/water-demo/uploads", {
+      const created = await apiFetch("/api/workspace/uploads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -68,7 +68,7 @@ export default function UploadPanel({
         if (!file) continue;
         setNote("正在上传" + role.label + "：" + file.name);
         const stored = await apiFetch(
-          "/api/water-demo/uploads/" + uploadId + "/" + role.id,
+          "/api/workspace/uploads/" + uploadId + "/" + role.id,
           {
             method: "PUT",
             headers: {
@@ -83,7 +83,7 @@ export default function UploadPanel({
       }
       setNote("正在检查栅格的坐标系和波段…");
       const finalized = await apiFetch(
-        "/api/water-demo/uploads/" + uploadId + "/finalize",
+        "/api/workspace/uploads/" + uploadId + "/finalize",
         { method: "POST" },
       );
       const finalizedBody = await readBody(finalized);

@@ -110,6 +110,7 @@ def write_progress(
     Terrabox execution feed. The CLI remains usable when no progress file is
     requested.
     """
+    emit_event("stage", stage=stage, message=message, current_step=current_step, total_steps=total_steps, tool=tool)
     if path is None:
         return
     payload = {
@@ -310,16 +311,7 @@ def plan_with_model(
 ) -> dict[str, Any]:
     scenario = SCENARIOS[input_kind]
     derive = scenario["derive_labels"]
-    candidates = [
-        {
-            "slug": slug,
-            "name": tools[slug].get("name"),
-            "description": tools[slug].get("description"),
-            "parameters": tools[slug].get("parameters"),
-        }
-        for slug in CORE_TOOL_SLUGS
-        if slug in tools and tools[slug].get("status") == "available"
-    ]
+    candidates = applicable_candidates(tools, input_kind)
     if derive and derive["tool"] not in {item["slug"] for item in candidates}:
         raise DemoError(f"{input_kind} input needs {derive['tool']}, which Terrabox does not report as available")
     if len(candidates) < 5:
@@ -379,24 +371,7 @@ def plan_with_model(
     selected = list(dict.fromkeys(str(item) for item in selected))
     order = list(dict.fromkeys(raw_order))
     removed_duplicates = [slug for index, slug in enumerate(raw_order) if slug in raw_order[:index]]
-    candidate_slugs = {item["slug"] for item in candidates}
-    if len(selected) < 5:
-        raise DemoError(f"Qwen selected only {len(selected)} tools; refusing an underspecified demo plan")
-    if set(selected) - candidate_slugs or set(order) - candidate_slugs:
-        raise DemoError("Qwen selected a tool outside the live applicable catalog")
-    if set(order) != set(selected):
-        raise DemoError("Qwen execution_order must contain exactly the selected tools")
-    if "geo_water.raster_profile_preflight" not in order or "geo_water.water_evidence" not in order:
-        raise DemoError("Qwen plan omitted the required profile preflight or water evidence gate")
-    preflight_index = order.index("geo_water.raster_profile_preflight")
-    if any(order.index(slug) < preflight_index for slug in REQUIRES_PREFLIGHT if slug in order and slug != "geo_water.raster_profile_preflight"):
-        raise DemoError("Qwen plan places pairwise analysis before profile preflight")
-    if "geo_basic.pixel_area" in order and order.index("geo_basic.pixel_area") < order.index("geo_water.water_evidence"):
-        raise DemoError("Qwen plan places pixel-area calculation before water evidence")
-    if derive and (
-        derive["tool"] not in order or order.index(derive["tool"]) > order.index("geo_water.water_evidence")
-    ):
-        raise DemoError(f"Qwen plan must run {derive['tool']} before water evidence for {input_kind} input")
+    validate_order(order, selected, candidates, input_kind)
     return {
         "status": "real_model_plan",
         "response_id": response.get("id"),
@@ -406,6 +381,90 @@ def plan_with_model(
         "reason": parsed.get("reason"),
         "candidates": candidates,
     }
+
+
+def applicable_candidates(tools: dict[str, dict[str, Any]], input_kind: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "slug": slug,
+            "name": tools[slug].get("name"),
+            "description": tools[slug].get("description"),
+            "parameters": tools[slug].get("parameters"),
+        }
+        for slug in CORE_TOOL_SLUGS
+        if slug in tools and tools[slug].get("status") == "available"
+    ]
+
+
+def validate_order(
+    order: list[str], selected: list[str], candidates: list[dict[str, Any]], input_kind: str
+) -> None:
+    """Reject plans that break the scientific ordering rules, whoever wrote them."""
+    derive = SCENARIOS[input_kind]["derive_labels"]
+    candidate_slugs = {item["slug"] for item in candidates}
+    if len(selected) < 5:
+        raise DemoError(f"Plan selects only {len(selected)} tools; refusing an underspecified plan")
+    if set(selected) - candidate_slugs or set(order) - candidate_slugs:
+        raise DemoError("Plan uses a tool outside the live applicable catalog")
+    if set(order) != set(selected):
+        raise DemoError("Plan execution_order must contain exactly the selected tools")
+    if "geo_water.raster_profile_preflight" not in order or "geo_water.water_evidence" not in order:
+        raise DemoError("Plan omits the required profile preflight or water evidence gate")
+    preflight_index = order.index("geo_water.raster_profile_preflight")
+    if any(order.index(slug) < preflight_index for slug in REQUIRES_PREFLIGHT if slug in order and slug != "geo_water.raster_profile_preflight"):
+        raise DemoError("Plan places pairwise analysis before profile preflight")
+    if "geo_basic.pixel_area" in order and order.index("geo_basic.pixel_area") < order.index("geo_water.water_evidence"):
+        raise DemoError("Plan places pixel-area calculation before water evidence")
+    if derive and (
+        derive["tool"] not in order or order.index(derive["tool"]) > order.index("geo_water.water_evidence")
+    ):
+        raise DemoError(f"Plan must run {derive['tool']} before water evidence for {input_kind} input")
+
+
+def confirmed_plan(path: Path, tools: dict[str, dict[str, Any]], input_kind: str) -> dict[str, Any]:
+    """A plan the user already confirmed in the workspace; it is re-validated, never re-planned."""
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DemoError(f"Confirmed plan is unreadable: {exc}") from exc
+    order = [str(item) for item in stored.get("execution_order") or []]
+    candidates = applicable_candidates(tools, input_kind)
+    validate_order(order, order, candidates, input_kind)
+    return {
+        "status": "confirmed_plan",
+        "plan_id": stored.get("plan_id"),
+        "selected_tools": order,
+        "execution_order": order,
+        "removed_duplicates": stored.get("removed_duplicates") or [],
+        "reason": stored.get("reason"),
+        "candidates": candidates,
+    }
+
+
+EVENTS_PATH: Path | None = None
+
+
+def emit_event(kind: str, **data: Any) -> None:
+    """Append one JSON line to the events file the workspace streams to the browser."""
+    if EVENTS_PATH is None:
+        return
+    line = json.dumps({"type": kind, "at": utc_now(), **data}, ensure_ascii=False)
+    try:
+        with EVENTS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        return
+
+
+def brief_outputs(outputs: Any) -> dict[str, Any]:
+    """A few scalar fields of a tool result, enough to show progress in the browser."""
+    if not isinstance(outputs, dict):
+        return {}
+    keys = (
+        "reason_code", "threshold", "method", "foreground_fraction", "width", "height", "crs",
+        "after_water_pixels", "new_water_area_m2", "area_km2", "value", "stat",
+    )
+    return {key: outputs[key] for key in keys if key in outputs and not isinstance(outputs[key], (dict, list))}
 
 
 def execution_id(run_id: str, chain: str, step: int) -> str:
@@ -425,6 +484,8 @@ def call_tool(
     scenario: str = "paired_water_water_labels",
 ) -> dict[str, Any]:
     call_id = execution_id(run_id, chain, step)
+    emit_event("tool_started", chain=chain, step=step, tool=slug, execution_id=call_id, target=inputs.get("_target"))
+    inputs = {key: value for key, value in inputs.items() if key != "_target"}
     metadata = {
         "execution_id": call_id,
         "demo_id": run_id,
@@ -459,6 +520,18 @@ def call_tool(
         record["execution_blocked"] = outputs.get("execution_blocked")
         record["reason_code"] = outputs.get("reason_code")
         record["failed_checks"] = outputs.get("failed_checks")
+    emit_event(
+        "tool_finished",
+        chain=chain,
+        step=step,
+        tool=slug,
+        execution_id=record["execution_id"],
+        success=record["success"],
+        blocked=bool(record.get("execution_blocked")),
+        reason_code=record.get("reason_code"),
+        outputs=brief_outputs(outputs),
+        error=record.get("error"),
+    )
     return record
 
 
@@ -548,6 +621,7 @@ def run_success_chain(
             threshold = None
             for target, source in (("after", after), ("before", before)):
                 inputs = {
+                    "_target": target,
                     "input_path": source,
                     "output_path": str(output_dir / f"step_{step:02d}_{target}_water_mask.tif"),
                     **derive["params"],
@@ -707,6 +781,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also run the gate self-check: preflight on the deliberately mismatched raster, expecting a refusal",
     )
     parser.add_argument(
+        "--plan-file",
+        type=Path,
+        help="Execute this confirmed plan (JSON with execution_order) instead of asking the model",
+    )
+    parser.add_argument(
+        "--events-file",
+        type=Path,
+        help="Append one JSON event per line (stages, tool start/finish) for streaming",
+    )
+    parser.add_argument(
         "--progress-file",
         type=Path,
         help="Optional JSON status file for the web adapter",
@@ -718,6 +802,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     progress_path = args.progress_file
+    global EVENTS_PATH
+    EVENTS_PATH = args.events_file
     try:
         write_progress(progress_path, "starting", "正在启动水体 Agent")
         api_key = load_api_key(args.api_key_file, args.api_key)
@@ -733,13 +819,22 @@ def main(argv: list[str] | None = None) -> int:
         write_progress(progress_path, "discovering", "正在发现 Terrabox 工具")
         toolkits, tools = discover_catalog(args.terrabox_url, api_key)
         catalog = summarize_catalog(toolkits, tools)
-        write_progress(progress_path, "planning", "正在请求 Qwen 生成工具执行顺序")
-        model_state = detect_model(args.llm_url, args.requested_model)
-        plan = plan_with_model(
-            args.llm_url, model_state, tools, user_prompt=args.prompt, input_kind=fixture_meta["input_kind"]
+        write_progress(
+            progress_path,
+            "planning",
+            "正在载入已确认的计划" if args.plan_file else "正在请求模型生成工具执行顺序",
         )
+        model_state = detect_model(args.llm_url, args.requested_model)
+        if args.plan_file:
+            plan = confirmed_plan(args.plan_file, tools, fixture_meta["input_kind"])
+        else:
+            plan = plan_with_model(
+                args.llm_url, model_state, tools, user_prompt=args.prompt, input_kind=fixture_meta["input_kind"]
+            )
+        emit_event("plan", execution_order=plan["execution_order"], status=plan["status"])
         summary: dict[str, Any] = {
             "schema_version": "terraflow-water-demo.v1",
+            "scenario": "water_change",
             "run_id": run_id,
             "created_at": utc_now(),
             "terraflow_url": args.terraflow_url,
@@ -788,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_path = args.summary_dir / f"terraflow_water_demo_{run_id}.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         write_progress(progress_path, "complete", "运行完成")
+        emit_event("run_finished", run_id=run_id, summary_path=str(summary_path))
         print(json.dumps({
             "status": "complete",
             "summary_path": str(summary_path),
@@ -807,6 +903,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except DemoError as exc:
         write_progress(progress_path, "error", str(exc))
+        emit_event("run_failed", run_id=run_id, error=str(exc))
         print(json.dumps({"status": "blocked", "run_id": run_id, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

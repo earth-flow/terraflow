@@ -4,7 +4,7 @@ import { CATEGORY_LABELS } from "./types";
 function Thumb({ src, caption }: { src?: string; caption: string }) {
   return (
     <figure className="min-w-0 flex-1">
-      <div className="water-agent-thumb aspect-square overflow-hidden rounded-lg">
+      <div className="ws-thumb aspect-square overflow-hidden rounded-lg">
         {src ? (
           <img
             src={src}
@@ -73,8 +73,8 @@ export default function DatasetCard({
     </>
   );
   const className =
-    "water-agent-dataset block w-full rounded-2xl border bg-card p-3 text-left transition " +
-    (selected ? "water-agent-dataset-selected" : "border-border");
+    "ws-dataset block w-full rounded-2xl border bg-card p-3 text-left transition " +
+    (selected ? "ws-dataset-selected" : "border-border");
   return onSelect ? (
     <button type="button" className={className} onClick={onSelect}>
       {body}

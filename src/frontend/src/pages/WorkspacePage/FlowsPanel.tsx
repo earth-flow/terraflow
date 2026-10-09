@@ -5,6 +5,7 @@ import type { FixtureOption } from "./types";
 import { formatTime } from "./types";
 
 type FlowRow = {
+  tags?: string[] | null;
   id: string;
   name: string;
   description?: string;
@@ -18,8 +19,9 @@ type IndexEntry = {
   created_at?: string;
 };
 
-// Flows created by the water workflow share this name prefix (see build_water_flow.py).
-const FLOW_PREFIX = "水体分析";
+// Workspace flows carry this tag (see build_water_flow.py); older ones only the name prefix.
+const WORKSPACE_TAG = "agent-workspace";
+const LEGACY_PREFIX = "水体分析";
 
 function displayTool(slug: string) {
   return slug.split(".").at(-1) ?? slug;
@@ -41,14 +43,20 @@ export default function FlowsPanel({
       apiFetch(
         "/api/v1/flows/?remove_example_flows=true&header_flows=true&get_all=true",
       ),
-      apiFetch("/api/water-demo/canvas-flows"),
+      apiFetch("/api/workspace/canvas-flows"),
     ]);
     const flowBody = (await flowResponse.json()) as FlowRow[];
     const indexBody = (await indexResponse.json()) as {
       flows?: Record<string, IndexEntry>;
     };
     if (Array.isArray(flowBody))
-      setFlows(flowBody.filter((flow) => flow.name?.startsWith(FLOW_PREFIX)));
+      setFlows(
+        flowBody.filter(
+          (flow) =>
+            flow.tags?.includes(WORKSPACE_TAG) ||
+            flow.name?.startsWith(LEGACY_PREFIX),
+        ),
+      );
     setIndex(indexBody.flows ?? {});
   }, []);
 
@@ -72,7 +80,7 @@ export default function FlowsPanel({
     setNote("正在生成模板 flow…");
     try {
       const response = await apiFetch(
-        "/api/water-demo/input-sets/" + encodeURIComponent(setId) + "/canvas",
+        "/api/workspace/input-sets/" + encodeURIComponent(setId) + "/canvas",
         { method: "POST" },
       );
       const body = (await response.json()) as {
@@ -103,7 +111,7 @@ export default function FlowsPanel({
       setNote("删除失败（HTTP " + response.status + "）。");
       return;
     }
-    await apiFetch("/api/water-demo/canvas-flows/" + flow.id, {
+    await apiFetch("/api/workspace/canvas-flows/" + flow.id, {
       method: "DELETE",
     });
     setNote("已删除。");
@@ -161,7 +169,7 @@ export default function FlowsPanel({
         </div>
         {flows.length === 0 ? (
           <p className="mt-4 text-sm text-muted-foreground">
-            还没有水体分析 flow。
+            还没有工作区生成的 flow。
           </p>
         ) : (
           <div className="mt-4 divide-y divide-border">

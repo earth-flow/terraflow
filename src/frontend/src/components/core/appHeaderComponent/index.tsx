@@ -68,6 +68,14 @@ export default function AppHeader(): JSX.Element {
         >
           <TerraflowLogo className="h-5 w-5" />
         </Button>
+        <Button
+          unstyled
+          onClick={() => navigate("/workspace")}
+          className="mr-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+          data-testid="header_workspace_link"
+        >
+          ← 工作区
+        </Button>
         <CustomOrgSelector />
       </div>
 

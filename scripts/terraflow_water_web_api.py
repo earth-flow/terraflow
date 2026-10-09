@@ -209,7 +209,7 @@ def fixture_option(fixture_id: str, path: Path, meta: dict[str, Any]) -> dict[st
     has_mismatch = (path / "mismatch.tif").is_file()
     scenes = meta.get("scenes") or {}
     category = fixture_category(meta)
-    preview_base = f"/api/water-demo/input-sets/{fixture_id}/preview"
+    preview_base = f"/api/workspace/input-sets/{fixture_id}/preview"
     return {
         "id": fixture_id,
         "title": meta.get("title") or meta.get("label") or fixture_id,
@@ -459,7 +459,10 @@ def tool_catalog() -> tuple[int, dict[str, Any]]:
         toolkits, tools = _RUNNER.discover_catalog(_RUNNER.DEFAULT_TERRABOX_URL, api_key)
     except _RUNNER.DemoError as exc:
         return 502, {"status": "error", "error": f"无法读取 Terrabox 工具目录：{exc}"}
-    core = set(_RUNNER.CORE_TOOL_SLUGS)
+    used_by: dict[str, list[str]] = {}
+    for spec in workspace_scenarios.TASK_SCENARIOS.values():
+        for slug in spec["tools"]:
+            used_by.setdefault(slug, []).append(spec["title"])
     tool_rows = [
         {
             "slug": slug,
@@ -468,7 +471,7 @@ def tool_catalog() -> tuple[int, dict[str, Any]]:
             "status": spec.get("status"),
             "toolkit_status": spec.get("toolkit_status"),
             "description": str(spec.get("description") or "")[:300],
-            "water_chain": slug in core,
+            "scenarios": used_by.get(slug, []),
         }
         for slug, spec in sorted(tools.items())
     ]
@@ -491,8 +494,8 @@ def tool_catalog() -> tuple[int, dict[str, Any]]:
         "fetched_at": utc_now(),
         "toolkits": toolkit_rows,
         "tools": tool_rows,
-        "water_chain_tools": list(_RUNNER.CORE_TOOL_SLUGS),
-        "scenarios": _RUNNER.SCENARIOS,
+        "scenario_count": len(workspace_scenarios.TASK_SCENARIOS),
+        "presets": _RUNNER.SCENARIOS,
     }
     _TOOLS_CACHE.update(value=payload, at=time.monotonic())
     return 200, payload
@@ -999,6 +1002,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
+    def _normalize_path(self) -> None:
+        # /api/workspace/* is the public prefix; /api/water-demo/* stays as an alias.
+        if self.path.startswith("/api/workspace/") or self.path == "/api/workspace":
+            self.path = "/api/water-demo" + self.path[len("/api/workspace") :]
+
+    def _stream(self, events: Any) -> None:
+        """Send server-sent events; compression proxies skip bodies marked no-transform."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for event, data in events:
+                self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _authorized(self) -> bool:
         if not REQUIRE_LOGIN or session_is_valid(request_token(self.headers)):
             return True
@@ -1007,6 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:
+        self._normalize_path()
         parsed = urlsplit(self.path)
         path = parsed.path.rstrip("/")
         if path != "/api/water-demo/health" and not self._authorized():
@@ -1023,6 +1047,16 @@ class Handler(BaseHTTPRequestHandler):
                     "active_job_id": active,
                 },
             )
+            return
+        if path == "/api/water-demo/scenarios":
+            self._send(200, {"status": "ok", "scenarios": workspace_scenarios.scenario_catalog()})
+            return
+        if path == "/api/water-demo/conversations":
+            self._send(200, {"status": "ok", "conversations": AGENT.store.list()})
+            return
+        if path.startswith("/api/water-demo/conversations/"):
+            conversation = AGENT.store.load(path.rsplit("/", 1)[-1])
+            self._send(200 if conversation else 404, conversation or {"status": "not_found", "error": "会话不存在"})
             return
         if path == "/api/water-demo/tools":
             self._send(*tool_catalog())
@@ -1044,6 +1078,10 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) == 6 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "preview":
             self._send_png(input_preview(parts[3], parts[5]))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "result":
+            detail = run_result(parts[3])
+            self._send(200 if detail else 404, detail or {"status": "not_found", "error": "运行记录不存在"})
             return
         if len(parts) == 6 and parts[:3] == ["api", "water-demo", "runs"] and parts[4] == "preview":
             self._send_png(run_preview(parts[3], parts[5]))
@@ -1079,15 +1117,21 @@ class Handler(BaseHTTPRequestHandler):
         return payload if isinstance(payload, dict) else None
 
     def do_DELETE(self) -> None:
+        self._normalize_path()
         if not self._authorized():
             return
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
+        if len(parts) == 4 and parts[:3] == ["api", "water-demo", "conversations"]:
+            deleted = AGENT.store.delete(parts[3])
+            self._send(200 if deleted else 404, {"status": "deleted" if deleted else "not_found"})
+            return
         if len(parts) == 4 and parts[:3] == ["api", "water-demo", "canvas-flows"] and _SAFE_ID.fullmatch(parts[3]):
             self._send(*forget_canvas_flow(parts[3]))
             return
         self._send(404, {"status": "not_found", "error": "unknown endpoint"})
 
     def do_PUT(self) -> None:
+        self._normalize_path()
         if not self._authorized():
             return
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
@@ -1106,10 +1150,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, body)
 
     def do_POST(self) -> None:
+        self._normalize_path()
         if not self._authorized():
             return
         path = urlsplit(self.path).path.rstrip("/")
         parts = [unquote(part) for part in path.split("/") if part]
+        if path == "/api/water-demo/conversations":
+            payload = self._read_json_body() or {}
+            self._send(201, AGENT.store.create(str(payload.get("title") or "") or None))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "messages":
+            payload = self._read_json_body()
+            content = str((payload or {}).get("content") or "").strip()[:MAX_PROMPT_LENGTH]
+            if not content or AGENT.store.load(parts[3]) is None:
+                self._send(400, {"status": "invalid_request", "error": "会话不存在或消息为空。"})
+                return
+            attachments = [str(item) for item in (payload.get("attachments") or []) if isinstance(item, str)][:4]
+            self._stream(AGENT.handle_message(parts[3], content, attachments))
+            return
+        if len(parts) == 7 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "plans":
+            if parts[6] == "execute":
+                payload = self._read_json_body() or {}
+                self._stream(AGENT.execute(parts[3], parts[5], bool(payload.get("self_check"))))
+                return
+            if parts[6] == "cancel":
+                updated = AGENT.cancel(parts[3], parts[5])
+                self._send(200 if updated else 409, updated or {"status": "conflict", "error": "计划不能取消。"})
+                return
         if path == "/api/water-demo/resolve-input":
             payload = self._read_json_body()
             if payload is None or not str(payload.get("prompt") or "").strip():
@@ -1213,6 +1280,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("[water-web] " + (format % args) + "\n")
+
+
+# Imported here because the agent and scenario modules use the functions above.
+import workspace_agent  # noqa: E402
+import workspace_scenarios  # noqa: E402
+
+AGENT = workspace_agent.WorkspaceAgent(sys.modules[__name__])
+
+
+def run_result(run_id: str) -> dict[str, Any] | None:
+    summary_file = summary_path_for(run_id)
+    summary = read_json(summary_file) if summary_file else None
+    if not isinstance(summary, dict):
+        return None
+    return {
+        "run_id": run_id,
+        "created_at": summary.get("created_at"),
+        "prompt": (summary.get("request") or {}).get("prompt"),
+        "dataset": {key: (summary.get("fixtures") or {}).get(key) for key in ("title", "label", "input_kind", "type")},
+        "model": (summary.get("model") or {}).get("model_used"),
+        "plan": (summary.get("plan") or {}).get("execution_order"),
+        "result": workspace_scenarios.build_result(
+            summary, lambda name: f"/api/workspace/runs/{run_id}/preview/{name}"
+        ),
+    }
 
 
 def main() -> int:

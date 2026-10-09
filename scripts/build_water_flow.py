@@ -33,6 +33,9 @@ from urllib.request import Request, urlopen
 from lfx.graph.flow_builder.builder import build_flow_from_spec
 from lfx.interface.earthflow_terrabox import component_class_name
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_scenarios import TASK_SCENARIOS  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TERRAFLOW_URL = os.environ.get("TERRAFLOW_BASE_URL", "http://127.0.0.1:7861")
 DEFAULT_RUNTIME_DIR = os.environ.get("TERRAFLOW_WATER_RUNTIME_DIR", "/data2/liyezhuoxin/terrabox-water-demo/runtime")
@@ -303,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = runtime_dir / "canvas-runs" / flow_key
     output_dir.mkdir(parents=True, exist_ok=True)
     spec = build_spec(
-        name=f"水体分析 · {meta.get('label') or set_id} · {flow_key}",
+        name=f"{TASK_SCENARIOS['water_change']['title']} · {meta.get('title') or meta.get('label') or set_id} · {flow_key}",
         description=description,
         set_id=set_id,
         plan=plan,
@@ -327,7 +330,13 @@ def main(argv: list[str] | None = None) -> int:
     created = http_json(
         f"{base_url}/api/v1/flows/",
         token=token,
-        payload={"name": flow["name"], "description": flow["description"], "data": flow["data"]},
+        # Workspace flows are found by this tag rather than by name.
+        payload={
+            "name": flow["name"],
+            "description": flow["description"],
+            "data": flow["data"],
+            "tags": ["agent-workspace", "water_change"],
+        },
     )
     print(
         json.dumps(

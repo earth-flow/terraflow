@@ -42,7 +42,16 @@ import ModelProvidersPage from "./pages/SettingsPage/pages/ModelProvidersPage";
 import MessagesPage from "./pages/SettingsPage/pages/messagesPage";
 import ShortcutsPage from "./pages/SettingsPage/pages/ShortcutsPage";
 import ViewPage from "./pages/ViewPage";
-import WaterAgentPage from "./pages/WaterAgentPage";
+import ChatPage from "./pages/WorkspacePage/ChatPage";
+import {
+  DataPage,
+  FlowsPage,
+  RunsPage,
+  ToolsPage,
+} from "./pages/WorkspacePage/pages";
+import RunDetailPage from "./pages/WorkspacePage/RunDetailPage";
+import ScenariosPage from "./pages/WorkspacePage/ScenariosPage";
+import WorkspaceShell from "./pages/WorkspacePage/WorkspaceShell";
 
 const AdminPage = lazy(() => import("./pages/AdminPage"));
 const LoginAdminPage = lazy(() => import("./pages/AdminPage/LoginPage"));
@@ -87,11 +96,22 @@ const router = createBrowserRouter(
             }
           >
             <Route path="" element={<AppAuthenticatedPage />}>
+              {/* Agent Workspace: its own shell, outside the Langflow dashboard frame. */}
+              <Route path="workspace" element={<WorkspaceShell />}>
+                <Route index element={<ChatPage />} />
+                <Route path="c/:conversationId" element={<ChatPage />} />
+                <Route path="data" element={<DataPage />} />
+                <Route path="scenarios" element={<ScenariosPage />} />
+                <Route path="flows" element={<FlowsPage />} />
+                <Route path="tools" element={<ToolsPage />} />
+                <Route path="runs" element={<RunsPage />} />
+                <Route path="runs/:runId" element={<RunDetailPage />} />
+              </Route>
               <Route path="" element={<CustomDashboardWrapperPage />}>
                 <Route path="" element={<CollectionPage />}>
                   <Route
                     index
-                    element={<CustomNavigate replace to={"flows"} />}
+                    element={<CustomNavigate replace to="/workspace" />}
                   />
                   {ENABLE_FILE_MANAGEMENT && (
                     <Route path="assets">
@@ -146,7 +166,6 @@ const router = createBrowserRouter(
                     />
                   </Route>
                 </Route>
-                <Route path="workspace" element={<WaterAgentPage />} />
                 <Route
                   path="water-agent"
                   element={<CustomNavigate replace to="/workspace" />}
