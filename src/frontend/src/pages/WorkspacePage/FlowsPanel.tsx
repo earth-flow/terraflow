@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { apiFetch } from "./api";
-import type { FixtureOption } from "./types";
+import { API, apiFetch, apiJson, pickableScenes, postJson } from "./api";
+import type { Scenario, Scene } from "./types";
 import { formatTime } from "./types";
 
 type FlowRow = {
@@ -15,6 +15,8 @@ type IndexEntry = {
   flow_id: string;
   canvas_path: string;
   input_set?: string;
+  scenario?: string;
+  scenes?: Record<string, string>;
   plan?: string[];
   created_at?: string;
 };
@@ -27,14 +29,12 @@ function displayTool(slug: string) {
   return slug.split(".").at(-1) ?? slug;
 }
 
-export default function FlowsPanel({
-  fixtures,
-}: {
-  fixtures: FixtureOption[];
-}) {
+export default function FlowsPanel({ scenes }: { scenes: Scene[] }) {
   const [flows, setFlows] = useState<FlowRow[]>([]);
   const [index, setIndex] = useState<Record<string, IndexEntry>>({});
-  const [setId, setSetId] = useState("");
+  const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [scenarioId, setScenarioId] = useState("");
+  const [roles, setRoles] = useState<Record<string, string>>({});
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -65,8 +65,21 @@ export default function FlowsPanel({
   }, [refresh]);
 
   useEffect(() => {
-    if (!setId && fixtures[0]) setSetId(fixtures[0].id);
-  }, [fixtures, setId]);
+    void apiJson<{ scenarios: Scenario[] }>(API + "/scenarios")
+      .then((body) => {
+        setScenarios(body.scenarios);
+        setScenarioId((current) => current || body.scenarios[0]?.id || "");
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const scenario = scenarios.find((item) => item.id === scenarioId);
+  const choices = pickableScenes(scenes, false).filter((scene) =>
+    scenario?.input_kinds.includes(scene.input_kind),
+  );
+  const ready =
+    scenario?.inputs.every((input) => roles[input.role]) &&
+    new Set(Object.values(roles)).size === Object.keys(roles).length;
 
   const sourceByFlow = new Map(
     Object.entries(index).map(([key, entry]) => [
@@ -76,13 +89,16 @@ export default function FlowsPanel({
   );
 
   async function createTemplate() {
+    if (!scenario) return;
     setBusy(true);
     setNote("正在生成模板 flow…");
     try {
-      const response = await apiFetch(
-        "/api/workspace/input-sets/" + encodeURIComponent(setId) + "/canvas",
-        { method: "POST" },
-      );
+      const response = await postJson(API + "/canvas-templates", {
+        scenario: scenario.id,
+        inputs: Object.fromEntries(
+          scenario.inputs.map((input) => [input.role, roles[input.role]]),
+        ),
+      });
       const body = (await response.json()) as {
         error?: string;
         status?: string;
@@ -90,7 +106,7 @@ export default function FlowsPanel({
       if (!response.ok) throw new Error(body.error || "模板 flow 生成失败。");
       setNote(
         body.status === "exists"
-          ? "该输入组合已有模板 flow。"
+          ? "这组影像已有该场景的模板 flow。"
           : "模板 flow 已生成。",
       );
       await refresh();
@@ -124,25 +140,49 @@ export default function FlowsPanel({
         <h2 className="font-semibold">Flow</h2>
         <p className="mt-1 text-sm leading-6 text-muted-foreground">
           每次对话运行都可以生成一个由真实组件组成的 Canvas flow，保存在
-          Terraflow 中，可以打开、修改和重跑。也可以直接为某个输入组合生成模板
-          flow。
+          Terraflow
+          中，可以打开、修改和重跑。也可以选一个场景和影像，直接生成模板 flow。
         </p>
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <select
-            aria-label="模板输入组合"
-            value={setId}
-            onChange={(event) => setSetId(event.target.value)}
+            aria-label="模板场景"
+            value={scenarioId}
+            onChange={(event) => {
+              setScenarioId(event.target.value);
+              setRoles({});
+            }}
             className="rounded-xl border border-input bg-background px-3 py-2 text-sm"
           >
-            {fixtures.map((fixture) => (
-              <option key={fixture.id} value={fixture.id}>
-                {fixture.title}
+            {scenarios.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.title}
               </option>
             ))}
           </select>
+          {scenario?.inputs.map((input) => (
+            <select
+              key={input.role}
+              aria-label={"模板" + input.label}
+              value={roles[input.role] ?? ""}
+              onChange={(event) =>
+                setRoles((current) => ({
+                  ...current,
+                  [input.role]: event.target.value,
+                }))
+              }
+              className="max-w-[16rem] rounded-xl border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value="">{input.label}…</option>
+              {choices.map((scene) => (
+                <option key={scene.id} value={scene.id}>
+                  {scene.collection_title} · {scene.acquired ?? scene.title}
+                </option>
+              ))}
+            </select>
+          ))}
           <Button
             type="button"
-            disabled={busy || !setId}
+            disabled={busy || !ready}
             onClick={() => void createTemplate()}
           >
             {busy ? "生成中…" : "生成模板 flow"}
@@ -175,10 +215,16 @@ export default function FlowsPanel({
           <div className="mt-4 divide-y divide-border">
             {flows.map((flow) => {
               const source = sourceByFlow.get(flow.id);
+              const scenarioTitle = scenarios.find(
+                (item) => item.id === source?.entry.scenario,
+              )?.title;
               const origin = !source
                 ? "命令行生成"
                 : source.key.startsWith("template:")
-                  ? "模板 · " + source.key.slice("template:".length)
+                  ? "模板 · " +
+                    (scenarioTitle ??
+                      source.entry.input_set ??
+                      source.key.slice("template:".length))
                   : "运行 " + source.key;
               return (
                 <div

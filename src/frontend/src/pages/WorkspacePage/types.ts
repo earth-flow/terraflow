@@ -1,37 +1,48 @@
-export type SceneInfo = {
-  item_id?: string;
-  datetime?: string;
-  relative_orbit?: number;
-  orbit_state?: string;
-  polarization?: string;
-};
-
-export type FixtureInfo = {
-  type?: string;
-  label?: string;
-  title?: string;
-  description?: string;
-  input_kind?: string;
-  event?: string;
-  scenes?: { before?: SceneInfo; after?: SceneInfo };
-  grid?: { crs?: string; shape?: number[]; resolution_m?: number };
-  claim_boundary?: string;
-};
-
-export type FixtureOption = FixtureInfo & {
+export type Scene = {
   id: string;
-  label: string;
   title: string;
-  description: string;
-  source: "synthetic" | "observed" | "uploaded";
-  category: "synthetic" | "observed" | "uploaded" | "test" | string;
-  audience: "user" | "developer";
+  collection_id: string;
+  collection_title: string;
   place?: string | null;
-  period?: string | null;
+  event?: string | null;
+  acquired?: string | null;
+  sequence?: number;
   sensor?: string;
+  input_kind: string;
+  input_scale?: string;
+  kind_label?: string;
+  category: string;
+  audience: "user" | "developer";
   area_km2?: number | null;
-  previews?: { before?: string; after?: string };
-  has_mismatch?: boolean;
+  preview?: string;
+  grid?: {
+    crs?: string | null;
+    shape?: number[] | null;
+    resolution?: number[] | null;
+  };
+  source?: {
+    item_id?: string;
+    datetime?: string;
+    platform?: string;
+    relative_orbit?: number;
+    orbit_state?: string;
+    polarization?: string;
+    stac_item_url?: string;
+  };
+  original_name?: string | null;
+  claim_boundary?: string | null;
+  self_check_for?: string;
+};
+
+export type Collection = {
+  id: string;
+  title: string;
+  place?: string | null;
+  event?: string | null;
+  period?: string | null;
+  category: string;
+  audience: "user" | "developer";
+  scene_ids: string[];
 };
 
 export const CATEGORY_LABELS: Record<string, string> = {
@@ -50,34 +61,14 @@ export type HistoryItem = {
   prompt?: string;
   fixture_id?: string;
   fixture_label?: string;
+  scenario_title?: string;
+  input_title?: string;
   model_used?: string;
   execution_count?: number;
   success_status?: string;
   rejection_reason?: string;
   error?: string;
 };
-
-export const SOURCE_LABELS = {
-  synthetic: "合成",
-  observed: "真实观测",
-  uploaded: "上传",
-} as const;
-
-export function sceneLine(role: string, scene?: SceneInfo) {
-  if (!scene) return null;
-  return (
-    role +
-    "：" +
-    (scene.datetime ?? "").slice(0, 16).replace("T", " ") +
-    " UTC，" +
-    (scene.polarization ?? "") +
-    "，相对轨道 " +
-    (scene.relative_orbit ?? "—") +
-    "（" +
-    (scene.orbit_state ?? "—") +
-    "）"
-  );
-}
 
 export function formatTime(value?: string) {
   return value ? value.slice(0, 19).replace("T", " ") : "—";
@@ -123,6 +114,7 @@ export type GenericResult = {
     blocked_tool?: string | null;
     reason_code?: string | null;
     failed_checks?: string[];
+    label?: string;
     description?: string;
   };
   self_check?: {
@@ -144,18 +136,32 @@ export type StepEvent = {
   outputs?: Record<string, unknown>;
 };
 
+export type PlanInput = {
+  role: string;
+  label: string;
+  scene_id: string;
+  scene_title: string;
+  collection_title: string;
+  acquired?: string | null;
+  preview?: string;
+};
+
 export type PlanInfo = {
   scenario: string;
   scenario_title: string;
-  input_set: string;
+  /** Absent on plans written before the scene library. */
+  inputs?: PlanInput[];
   input_title: string;
   input_kind: string;
-  has_self_check_sample: boolean;
+  input_scale?: string;
+  self_check_available?: boolean;
   execution_order: string[];
   reason?: string;
   model?: string;
   matched_by?: string | null;
   mentioned?: string | null;
+  notes?: string[];
+  inputs_changed_by_user?: boolean;
 };
 
 export type ChatMessage = {

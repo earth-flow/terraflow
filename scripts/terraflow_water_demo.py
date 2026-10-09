@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a replayable Terraflow/Terrabox paired water-label demo.
+"""Run a replayable Terraflow/Terrabox water analysis (paired change or single scene).
 
 The script deliberately keeps the LLM boundary small and inspectable.  The
 model chooses an ordered subset of tools from the live Terrabox catalog.  The
@@ -7,6 +7,8 @@ runner validates that choice against the catalog, then applies the raster
 preflight gate before any pairwise operation.  It records the Terrabox
 execution id, manifest path, and analytics trace for every call.
 
+Two tasks share the runner: ``water_change`` compares before.tif and
+after.tif on one grid; ``water_extent`` measures water in a single scene.tif.
 Inputs are described by an optional fixture.json: 0/1 water labels (the
 synthetic engineering fixture when the file is absent) or SAR backscatter,
 which is first turned into threshold water masks.  Results do not claim
@@ -73,6 +75,35 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "Run geo_raster.threshold_segmentation before geo_water.water_evidence; "
             "the runner fills threshold direction and units from the scenario preset."
         ),
+    },
+}
+# Tasks: which tools a plan may use and the minimum plan size. Ordering rules
+# live in validate_order and apply to model plans and confirmed plans alike.
+TASKS: dict[str, dict[str, Any]] = {
+    "water_change": {
+        "tools": CORE_TOOL_SLUGS,
+        "min_tools": 5,
+        "constraints": [
+            "Inspect a raster before pairwise work.",
+            "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
+            "Run geo_water.water_evidence before geo_basic.pixel_area.",
+        ],
+        "default_prompt": "Select an executable ordered plan for a paired water GeoTIFF analysis.",
+    },
+    "water_extent": {
+        "tools": (
+            "raster_viewer.inspect_geotiff",
+            "geo_raster.raster_stats",
+            "geo_raster.threshold_segmentation",
+            "geo_water.water_extent",
+        ),
+        "min_tools": 2,
+        "constraints": [
+            "There is one scene; do not use pairwise tools.",
+            "Inspect the raster first.",
+            "End with geo_water.water_extent, which checks labels and the area grid before measuring water.",
+        ],
+        "default_prompt": "Select an executable ordered plan to measure water in one GeoTIFF scene.",
     },
 }
 PAIRWISE_TOOL_SLUGS = {
@@ -308,25 +339,27 @@ def plan_with_model(
     tools: dict[str, dict[str, Any]],
     user_prompt: str | None = None,
     input_kind: str = "water_labels",
+    task: str = "water_change",
 ) -> dict[str, Any]:
     scenario = SCENARIOS[input_kind]
+    spec = TASKS[task]
     derive = scenario["derive_labels"]
-    candidates = applicable_candidates(tools, input_kind)
+    candidates = applicable_candidates(tools, input_kind, task)
     if derive and derive["tool"] not in {item["slug"] for item in candidates}:
         raise DemoError(f"{input_kind} input needs {derive['tool']}, which Terrabox does not report as available")
-    if len(candidates) < 5:
-        raise DemoError(f"Only {len(candidates)} applicable Terrabox tools are available; need at least five")
+    if len(candidates) < spec["min_tools"]:
+        raise DemoError(
+            f"Only {len(candidates)} applicable Terrabox tools are available; need at least {spec['min_tools']}"
+        )
     constraints = [
         "Use only the supplied available tool slugs.",
-        "Select at least five tools.",
-        "Inspect a raster before pairwise work.",
-        "Run geo_water.raster_profile_preflight before geo_raster.raster_diff and geo_water.water_evidence.",
-        "Run geo_water.water_evidence before geo_basic.pixel_area.",
+        f"Select at least {spec['min_tools']} tools.",
+        *spec["constraints"],
     ]
     if scenario.get("planner_note"):
-        constraints.append(scenario["planner_note"])
+        constraints.append(scenario["planner_note"].replace("geo_water.water_evidence", _measure_tool(task)))
     prompt = {
-        "task": user_prompt or "Select an executable ordered plan for a paired water GeoTIFF analysis.",
+        "task": user_prompt or spec["default_prompt"],
         "input_kind": input_kind,
         "constraints": constraints + [
             "Do not claim flood causation or satellite performance.",
@@ -371,7 +404,7 @@ def plan_with_model(
     selected = list(dict.fromkeys(str(item) for item in selected))
     order = list(dict.fromkeys(raw_order))
     removed_duplicates = [slug for index, slug in enumerate(raw_order) if slug in raw_order[:index]]
-    validate_order(order, selected, candidates, input_kind)
+    validate_order(order, selected, candidates, input_kind, task)
     return {
         "status": "real_model_plan",
         "response_id": response.get("id"),
@@ -383,7 +416,18 @@ def plan_with_model(
     }
 
 
-def applicable_candidates(tools: dict[str, dict[str, Any]], input_kind: str) -> list[dict[str, Any]]:
+def _measure_tool(task: str) -> str:
+    return "geo_water.water_extent" if task == "water_extent" else "geo_water.water_evidence"
+
+
+def applicable_candidates(
+    tools: dict[str, dict[str, Any]], input_kind: str, task: str = "water_change"
+) -> list[dict[str, Any]]:
+    derive = SCENARIOS[input_kind]["derive_labels"]
+    allowed = TASKS[task]["tools"]
+    if task == "water_extent" and not derive:
+        # Label scenes are already water masks; there is nothing to threshold.
+        allowed = tuple(slug for slug in allowed if slug != "geo_raster.threshold_segmentation")
     return [
         {
             "slug": slug,
@@ -391,23 +435,35 @@ def applicable_candidates(tools: dict[str, dict[str, Any]], input_kind: str) -> 
             "description": tools[slug].get("description"),
             "parameters": tools[slug].get("parameters"),
         }
-        for slug in CORE_TOOL_SLUGS
+        for slug in allowed
         if slug in tools and tools[slug].get("status") == "available"
     ]
 
 
 def validate_order(
-    order: list[str], selected: list[str], candidates: list[dict[str, Any]], input_kind: str
+    order: list[str],
+    selected: list[str],
+    candidates: list[dict[str, Any]],
+    input_kind: str,
+    task: str = "water_change",
 ) -> None:
     """Reject plans that break the scientific ordering rules, whoever wrote them."""
     derive = SCENARIOS[input_kind]["derive_labels"]
     candidate_slugs = {item["slug"] for item in candidates}
-    if len(selected) < 5:
+    if len(selected) < TASKS[task]["min_tools"]:
         raise DemoError(f"Plan selects only {len(selected)} tools; refusing an underspecified plan")
     if set(selected) - candidate_slugs or set(order) - candidate_slugs:
         raise DemoError("Plan uses a tool outside the live applicable catalog")
     if set(order) != set(selected):
         raise DemoError("Plan execution_order must contain exactly the selected tools")
+    if task == "water_extent":
+        if "geo_water.water_extent" not in order:
+            raise DemoError("Plan omits geo_water.water_extent, which checks labels and the area grid")
+        if derive and (
+            derive["tool"] not in order or order.index(derive["tool"]) > order.index("geo_water.water_extent")
+        ):
+            raise DemoError(f"Plan must run {derive['tool']} before water extent for {input_kind} input")
+        return
     if "geo_water.raster_profile_preflight" not in order or "geo_water.water_evidence" not in order:
         raise DemoError("Plan omits the required profile preflight or water evidence gate")
     preflight_index = order.index("geo_water.raster_profile_preflight")
@@ -421,15 +477,17 @@ def validate_order(
         raise DemoError(f"Plan must run {derive['tool']} before water evidence for {input_kind} input")
 
 
-def confirmed_plan(path: Path, tools: dict[str, dict[str, Any]], input_kind: str) -> dict[str, Any]:
+def confirmed_plan(
+    path: Path, tools: dict[str, dict[str, Any]], input_kind: str, task: str = "water_change"
+) -> dict[str, Any]:
     """A plan the user already confirmed in the workspace; it is re-validated, never re-planned."""
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DemoError(f"Confirmed plan is unreadable: {exc}") from exc
     order = [str(item) for item in stored.get("execution_order") or []]
-    candidates = applicable_candidates(tools, input_kind)
-    validate_order(order, order, candidates, input_kind)
+    candidates = applicable_candidates(tools, input_kind, task)
+    validate_order(order, order, candidates, input_kind, task)
     return {
         "status": "confirmed_plan",
         "plan_id": stored.get("plan_id"),
@@ -463,6 +521,7 @@ def brief_outputs(outputs: Any) -> dict[str, Any]:
     keys = (
         "reason_code", "threshold", "method", "foreground_fraction", "width", "height", "crs",
         "after_water_pixels", "new_water_area_m2", "area_km2", "value", "stat",
+        "water_area_m2", "water_fraction", "valid_pixels",
     )
     return {key: outputs[key] for key in keys if key in outputs and not isinstance(outputs[key], (dict, list))}
 
@@ -484,7 +543,8 @@ def call_tool(
     scenario: str = "paired_water_water_labels",
 ) -> dict[str, Any]:
     call_id = execution_id(run_id, chain, step)
-    emit_event("tool_started", chain=chain, step=step, tool=slug, execution_id=call_id, target=inputs.get("_target"))
+    target = inputs.get("_target")
+    emit_event("tool_started", chain=chain, step=step, tool=slug, execution_id=call_id, target=target)
     inputs = {key: value for key, value in inputs.items() if key != "_target"}
     metadata = {
         "execution_id": call_id,
@@ -525,7 +585,8 @@ def call_tool(
         chain=chain,
         step=step,
         tool=slug,
-        execution_id=record["execution_id"],
+        target=target,
+        execution_id=call_id,
         success=record["success"],
         blocked=bool(record.get("execution_blocked")),
         reason_code=record.get("reason_code"),
@@ -687,6 +748,77 @@ def run_success_chain(
     }
 
 
+def run_extent_chain(
+    base_url: str,
+    api_key: str,
+    *,
+    run_id: str,
+    plan: dict[str, Any],
+    scene: str,
+    output_dir: Path,
+    model_state: dict[str, Any],
+    fixture_meta: dict[str, Any],
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Single-scene water: optional threshold mask, then geo_water.water_extent as the gate and measure."""
+    records: list[dict[str, Any]] = []
+    fixture_type = fixture_meta["type"]
+    scenario = f"single_scene_water_{fixture_meta['input_kind']}"
+    derive = SCENARIOS[fixture_meta["input_kind"]]["derive_labels"]
+    labels = scene
+    derived: dict[str, Any] | None = None
+    total = len(plan["execution_order"])
+    for step, slug in enumerate(plan["execution_order"], start=1):
+        if progress_cb:
+            progress_cb("executing_success", f"正在执行工具：{slug}", step, total, slug)
+        if slug == "raster_viewer.inspect_geotiff":
+            inputs = {"raster_path": scene, "include_histogram": False, "include_tags": True}
+        elif slug == "geo_raster.raster_stats":
+            inputs = {"input_path": scene, "stat": "mean"}
+        elif slug == "geo_raster.threshold_segmentation" and derive:
+            inputs = {
+                "_target": "scene",
+                "input_path": scene,
+                "output_path": str(output_dir / f"step_{step:02d}_scene_water_mask.tif"),
+                **derive["params"],
+                "input_transform": derive["transform_by_scale"][fixture_meta.get("input_scale", "linear")],
+                "method": "otsu",
+                "otsu_range": derive["otsu_range"],
+            }
+        elif slug == "geo_water.water_extent":
+            inputs = {"label_path": labels}
+        else:
+            raise DemoError(f"No safe input builder exists for selected tool {slug}")
+        record = call_tool(
+            base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
+            inputs=inputs, model_state=model_state, scenario=scenario,
+        )
+        if slug == "geo_raster.threshold_segmentation":
+            record["target"] = "scene"
+        records.append(record)
+        outputs = record.get("outputs") if isinstance(record.get("outputs"), dict) else {}
+        if not record["success"] and not outputs.get("execution_blocked"):
+            raise DemoError(f"Success chain tool failed: {slug}: {record.get('error')}")
+        if outputs.get("execution_blocked"):
+            return gate_refusal(record, outputs, fixture_type, records)
+        if slug == "geo_raster.threshold_segmentation":
+            labels = str(outputs.get("output_path") or inputs["output_path"])
+            derived = {
+                "tool": slug,
+                "preset": derive["preset"],
+                "threshold": outputs.get("threshold"),
+                "units": derive["units"],
+                "rule": "Otsu on this scene",
+            }
+    return {
+        "status": "success",
+        "fixture_type": fixture_type,
+        "execution_count": len(records),
+        "derived_labels": derived,
+        "steps": records,
+    }
+
+
 def run_rejection_chain(
     base_url: str,
     api_key: str,
@@ -776,6 +908,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prompt", help="Natural-language task sent to the model planner")
     parser.add_argument(
+        "--task",
+        choices=sorted(TASKS),
+        default="water_change",
+        help="water_change: before.tif/after.tif pair; water_extent: one scene.tif",
+    )
+    parser.add_argument(
         "--self-check",
         action="store_true",
         help="Also run the gate self-check: preflight on the deliberately mismatched raster, expecting a refusal",
@@ -807,10 +945,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         write_progress(progress_path, "starting", "正在启动水体 Agent")
         api_key = load_api_key(args.api_key_file, args.api_key)
-        before = require_file(args.fixtures_dir / "before.tif", "before fixture")
-        after = require_file(args.fixtures_dir / "after.tif", "after fixture")
-        mismatch_path = args.fixtures_dir / "mismatch.tif"
-        mismatch = str(mismatch_path) if mismatch_path.exists() else None
+        if args.task == "water_extent":
+            scene = require_file(args.fixtures_dir / "scene.tif", "scene")
+            before = after = mismatch = None
+        else:
+            scene = None
+            before = require_file(args.fixtures_dir / "before.tif", "before fixture")
+            after = require_file(args.fixtures_dir / "after.tif", "after fixture")
+            mismatch_path = args.fixtures_dir / "mismatch.tif"
+            mismatch = str(mismatch_path) if mismatch_path.exists() else None
         fixture_meta = load_fixture_meta(args.fixtures_dir)
         args.summary_dir.mkdir(parents=True, exist_ok=True)
         output_dir = args.summary_dir / run_id / "outputs"
@@ -824,17 +967,35 @@ def main(argv: list[str] | None = None) -> int:
             "planning",
             "正在载入已确认的计划" if args.plan_file else "正在请求模型生成工具执行顺序",
         )
-        model_state = detect_model(args.llm_url, args.requested_model)
+        try:
+            model_state = detect_model(args.llm_url, args.requested_model)
+        except DemoError as exc:
+            if not args.plan_file:
+                raise
+            # A confirmed plan runs without the model; record who planned it instead.
+            planned_by = json.loads(args.plan_file.read_text(encoding="utf-8")).get("model") or "unknown"
+            model_state = {
+                "model_requested": args.requested_model,
+                "model_used": planned_by,
+                "endpoint_model_id": None,
+                "fallback_reason": f"model endpoint unavailable at execution ({exc}); plan was confirmed earlier",
+                "llm_endpoint": args.llm_url,
+            }
         if args.plan_file:
-            plan = confirmed_plan(args.plan_file, tools, fixture_meta["input_kind"])
+            plan = confirmed_plan(args.plan_file, tools, fixture_meta["input_kind"], args.task)
         else:
             plan = plan_with_model(
-                args.llm_url, model_state, tools, user_prompt=args.prompt, input_kind=fixture_meta["input_kind"]
+                args.llm_url,
+                model_state,
+                tools,
+                user_prompt=args.prompt,
+                input_kind=fixture_meta["input_kind"],
+                task=args.task,
             )
         emit_event("plan", execution_order=plan["execution_order"], status=plan["status"])
         summary: dict[str, Any] = {
             "schema_version": "terraflow-water-demo.v1",
-            "scenario": "water_change",
+            "scenario": args.task,
             "run_id": run_id,
             "created_at": utc_now(),
             "terraflow_url": args.terraflow_url,
@@ -842,42 +1003,58 @@ def main(argv: list[str] | None = None) -> int:
             "branch": "feature/terraflow-water-demo",
             "fixtures": {
                 **fixture_meta,
-                "before": before,
-                "after": after,
-                "mismatch": mismatch,
+                **({"scene": scene} if scene else {"before": before, "after": after, "mismatch": mismatch}),
             },
             "catalog": catalog,
             "model": model_state,
             "plan": plan,
-            "request": {"prompt": args.prompt or "paired water-label engineering demo"},
+            "request": {"prompt": args.prompt or TASKS[args.task]["default_prompt"]},
         }
-        summary["success_chain"] = run_success_chain(
-            args.terrabox_url,
-            api_key,
-            run_id=run_id,
-            plan=plan,
-            before=before,
-            after=after,
-            output_dir=output_dir,
-            model_state=model_state,
-            fixture_meta=fixture_meta,
-            progress_cb=lambda stage, message, current, total, tool: write_progress(
-                progress_path, stage, message, current, total, tool
-            ),
+        progress = lambda stage, message, current, total, tool: write_progress(  # noqa: E731
+            progress_path, stage, message, current, total, tool
         )
-        summary["rejection_chain"] = run_rejection_chain(
-            args.terrabox_url,
-            api_key,
-            run_id=run_id,
-            before=before,
-            mismatch=mismatch,
-            model_state=model_state,
-            fixture_meta=fixture_meta,
-            self_check=args.self_check,
-            progress_cb=lambda stage, message, current, total, tool: write_progress(
-                progress_path, stage, message, current, total, tool
-            ),
-        )
+        if scene:
+            summary["success_chain"] = run_extent_chain(
+                args.terrabox_url,
+                api_key,
+                run_id=run_id,
+                plan=plan,
+                scene=scene,
+                output_dir=output_dir,
+                model_state=model_state,
+                fixture_meta=fixture_meta,
+                progress_cb=progress,
+            )
+            summary["rejection_chain"] = {
+                "status": "not_applicable",
+                "fixture_type": fixture_meta["type"],
+                "reason": "single-scene task has no pair to mismatch",
+                "steps": [],
+            }
+        else:
+            summary["success_chain"] = run_success_chain(
+                args.terrabox_url,
+                api_key,
+                run_id=run_id,
+                plan=plan,
+                before=before,
+                after=after,
+                output_dir=output_dir,
+                model_state=model_state,
+                fixture_meta=fixture_meta,
+                progress_cb=progress,
+            )
+            summary["rejection_chain"] = run_rejection_chain(
+                args.terrabox_url,
+                api_key,
+                run_id=run_id,
+                before=before,
+                mismatch=mismatch,
+                model_state=model_state,
+                fixture_meta=fixture_meta,
+                self_check=args.self_check,
+                progress_cb=progress,
+            )
         write_progress(progress_path, "recording", "正在整理执行记录和证据索引")
         attach_analytics(args.terrabox_url, api_key, summary)
         summary_path = args.summary_dir / f"terraflow_water_demo_{run_id}.json"

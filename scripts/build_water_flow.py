@@ -39,6 +39,14 @@ from workspace_scenarios import TASK_SCENARIOS  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TERRAFLOW_URL = os.environ.get("TERRAFLOW_BASE_URL", "http://127.0.0.1:7861")
 DEFAULT_RUNTIME_DIR = os.environ.get("TERRAFLOW_WATER_RUNTIME_DIR", "/data2/liyezhuoxin/terrabox-water-demo/runtime")
+DEFAULT_EXTENT_PLANS = {
+    "sar_backscatter": [
+        "raster_viewer.inspect_geotiff",
+        "geo_raster.threshold_segmentation",
+        "geo_water.water_extent",
+    ],
+    "water_labels": ["raster_viewer.inspect_geotiff", "geo_raster.raster_stats", "geo_water.water_extent"],
+}
 DEFAULT_PLANS = {
     "sar_backscatter": [
         "raster_viewer.inspect_geotiff",
@@ -141,6 +149,7 @@ def build_spec(
     has_mismatch: bool,
     scenarios: dict[str, Any],
     output_dir: Path,
+    scene_ids: dict[str, str] | None = None,
 ) -> str:
     nodes: dict[str, str] = {}
     edges: list[str] = []
@@ -159,15 +168,24 @@ def build_spec(
         config[f"{node_id}.field_path"] = path
         return f"{node_id}.value"
 
-    node("Input", "WaterInputSet")
-    config["Input.input_set"] = set_id
+    if scene_ids:
+        # Scene library runs: one Scene Input per role.
+        for node_id, role in (("Before", "before"), ("After", "after"), ("SelfCheck", "mismatch")):
+            if scene_ids.get(role):
+                node(node_id, "SceneInput")
+                config[f"{node_id}.scene_id"] = scene_ids[role]
+        before_src, after_src, mismatch_src = "Before.path", "After.path", "SelfCheck.path"
+    else:
+        node("Input", "WaterInputSet")
+        config["Input.input_set"] = set_id
+        before_src, after_src, mismatch_src = "Input.before_path", "Input.after_path", "Input.mismatch_path"
     tool("Preflight", "geo_water.raster_profile_preflight")
-    edges += ["Input.before_path -> Preflight.before_path", "Input.after_path -> Preflight.after_path"]
+    edges += [f"{before_src} -> Preflight.before_path", f"{after_src} -> Preflight.after_path"]
     node("Gate", "RasterPairGate")
     edges += [
         "Preflight.api_run_model -> Gate.preflight",
-        "Input.before_path -> Gate.before_path",
-        "Input.after_path -> Gate.after_path",
+        f"{before_src} -> Gate.before_path",
+        f"{after_src} -> Gate.after_path",
     ]
 
     derive = scenarios[input_kind]["derive_labels"]
@@ -177,11 +195,11 @@ def build_spec(
             continue
         if slug == "raster_viewer.inspect_geotiff":
             tool("Inspect", slug)
-            edges.append("Input.before_path -> Inspect.raster_path")
+            edges.append(f"{before_src} -> Inspect.raster_path")
             config["Inspect.include_histogram"] = False
         elif slug == "geo_raster.raster_stats":
             tool("Stats", slug)
-            edges.append("Input.after_path -> Stats.input_path")
+            edges.append(f"{after_src} -> Stats.input_path")
             config["Stats.stat"] = "mean"
         elif slug == "geo_raster.raster_diff":
             tool("Diff", slug)
@@ -212,7 +230,7 @@ def build_spec(
             label_before = field("BeforeMaskPath", "MaskBefore", "outputs.output_path")
         elif slug == "geo_raster.threshold_segmentation":
             tool("Threshold", slug)
-            edges.append("Input.after_path -> Threshold.input_path")
+            edges.append(f"{after_src} -> Threshold.input_path")
             config["Threshold.threshold"] = 0.5
             config["Threshold.output_path"] = str(output_dir / "threshold.tif")
         elif slug == "geo_water.water_evidence":
@@ -235,15 +253,67 @@ def build_spec(
         node("RefusalGate", "RasterPairGate")
         tool("RefusalEvidence", "geo_water.water_evidence")
         edges += [
-            "Input.before_path -> RefusalPreflight.before_path",
-            "Input.mismatch_path -> RefusalPreflight.after_path",
+            f"{before_src} -> RefusalPreflight.before_path",
+            f"{mismatch_src} -> RefusalPreflight.after_path",
             "RefusalPreflight.api_run_model -> RefusalGate.preflight",
-            "Input.before_path -> RefusalGate.before_path",
-            "Input.mismatch_path -> RefusalGate.after_path",
+            f"{before_src} -> RefusalGate.before_path",
+            f"{mismatch_src} -> RefusalGate.after_path",
             "RefusalGate.gated_before_path -> RefusalEvidence.before_path",
             "RefusalGate.gated_after_path -> RefusalEvidence.after_path",
         ]
+    return render_spec(name, description, nodes, edges, config)
 
+
+def build_extent_spec(
+    *,
+    name: str,
+    description: str,
+    scene_id: str,
+    plan: list[str],
+    input_kind: str,
+    input_scale: str,
+    scenarios: dict[str, Any],
+    output_dir: Path,
+) -> str:
+    """Single-scene water: Scene Input, optional threshold mask, then water extent (the area gate)."""
+    nodes: dict[str, str] = {"Scene": "SceneInput"}
+    edges: list[str] = []
+    config: dict[str, Any] = {"Scene.scene_id": scene_id}
+    derive = scenarios[input_kind]["derive_labels"]
+    labels = "Scene.path"
+    for slug in plan:
+        if slug == "raster_viewer.inspect_geotiff":
+            nodes["Inspect"] = component_class_name(slug)
+            edges.append("Scene.path -> Inspect.raster_path")
+            config["Inspect.include_histogram"] = False
+        elif slug == "geo_raster.raster_stats":
+            nodes["Stats"] = component_class_name(slug)
+            edges.append("Scene.path -> Stats.input_path")
+            config["Stats.stat"] = "mean"
+        elif slug == "geo_raster.threshold_segmentation" and derive:
+            nodes["Mask"] = component_class_name(slug)
+            edges.append("Scene.path -> Mask.input_path")
+            preset = {**derive["params"], "input_transform": derive["transform_by_scale"][input_scale]}
+            for key, value in preset.items():
+                config[f"Mask.{key}"] = value
+            config["Mask.method"] = "otsu"
+            config["Mask.otsu_range"] = json.dumps(derive["otsu_range"])
+            config["Mask.output_path"] = str(output_dir / "scene_water_mask.tif")
+            nodes["MaskPath"] = "ToolResultField"
+            edges.append("Mask.api_run_model -> MaskPath.result")
+            config["MaskPath.field_path"] = "outputs.output_path"
+            labels = "MaskPath.value"
+        elif slug == "geo_water.water_extent":
+            nodes["Extent"] = component_class_name(slug)
+        else:
+            msg = f"No canvas mapping for planned tool {slug}"
+            raise ValueError(msg)
+    if "Extent" in nodes:
+        edges.append(f"{labels} -> Extent.label_path")
+    return render_spec(name, description, nodes, edges, config)
+
+
+def render_spec(name: str, description: str, nodes: dict[str, str], edges: list[str], config: dict[str, Any]) -> str:
     lines = [f"name: {name}", f"description: {description}", "", "nodes:"]
     lines += [f"  {node_id}: {component}" for node_id, component in nodes.items()]
     lines += ["", "edges:"] + [f"  {edge}" for edge in edges]
@@ -259,7 +329,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run-id", help="Build the flow from this run summary's validated plan")
-    source.add_argument("--input-set", help="Build a template flow for this input set")
+    source.add_argument("--input-set", help="Build a template flow for this earlier before/after input set")
+    source.add_argument(
+        "--scenario",
+        choices=sorted(TASK_SCENARIOS),
+        help="Build a template flow for this scenario from library scenes (see --scene)",
+    )
+    parser.add_argument(
+        "--scene",
+        action="append",
+        default=[],
+        metavar="ROLE=SCENE_ID",
+        help="Scene for one scenario role, e.g. before=thessaly_2023_s1.before (repeat per role)",
+    )
     parser.add_argument("--plan", nargs="+", help="Tool slugs for a template flow (default per input kind)")
     parser.add_argument("--terraflow-url", default=DEFAULT_TERRAFLOW_URL)
     parser.add_argument("--runtime-dir", type=Path, default=Path(DEFAULT_RUNTIME_DIR))
@@ -277,17 +359,44 @@ def main(argv: list[str] | None = None) -> int:
     runner = load_runner()
     runtime_dir = args.runtime_dir
 
+    scene_ids = None
+    task = "water_change"
     if args.run_id:
         summary_path = runtime_dir / "demo-runs" / f"terraflow_water_demo_{args.run_id}.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        directory = Path(summary["fixtures"]["before"]).parent
+        task = summary.get("scenario") or "water_change"
+        fixtures = summary["fixtures"]
+        directory = Path(fixtures.get("scene") or fixtures["before"]).parent
         meta = runner.load_fixture_meta(directory)
         plan = summary["plan"]["execution_order"]
-        set_id = input_set_id(directory, runtime_dir)
+        scene_ids = dict(meta.get("scene_ids") or {}) or None
+        set_id = None if scene_ids else input_set_id(directory, runtime_dir)
         # Mirror the run: only runs that did the gate self-check get the refusal branch.
         self_check = (summary.get("rejection_chain") or {}).get("status") == "deterministic_refusal"
+        if scene_ids and self_check and (meta.get("self_check_sample") or {}).get("scene_id"):
+            scene_ids["mismatch"] = meta["self_check_sample"]["scene_id"]
         flow_key = args.run_id
-        description = f"Generated from water-agent run {args.run_id} (Qwen plan validated by the runner)."
+        description = f"Generated from workspace run {args.run_id} (plan validated by the runner)."
+    elif args.scenario:
+        # Template from library scenes: roles come from the command line, kinds from the scene index.
+        task = args.scenario
+        index = json.loads((runtime_dir / "scene-index.json").read_text(encoding="utf-8"))
+        scene_ids = dict(item.split("=", 1) for item in args.scene)
+        roles = [item["role"] for item in TASK_SCENARIOS[task]["inputs"]]
+        missing = [role for role in roles if scene_ids.get(role) not in index]
+        if missing:
+            msg = f"Missing or unknown scenes for roles: {', '.join(missing)}"
+            raise SystemExit(msg)
+        first = index[scene_ids[roles[0]]]
+        meta = {
+            "input_kind": first["input_kind"],
+            "input_scale": first.get("input_scale") or "linear",
+            "title": first.get("collection_title"),
+        }
+        plan = args.plan or (DEFAULT_EXTENT_PLANS if task == "water_extent" else DEFAULT_PLANS)[meta["input_kind"]]
+        set_id, self_check, directory = None, False, runtime_dir
+        flow_key = "template_" + "_".join(scene_ids[role] for role in roles)
+        description = f"Template {task} workflow for scenes " + ", ".join(f"{r}={scene_ids[r]}" for r in roles) + "."
     else:
         set_id = args.input_set
         directory = runtime_dir / "demo-fixtures" if set_id == "demo-fixtures" else None
@@ -305,17 +414,31 @@ def main(argv: list[str] | None = None) -> int:
 
     output_dir = runtime_dir / "canvas-runs" / flow_key
     output_dir.mkdir(parents=True, exist_ok=True)
-    spec = build_spec(
-        name=f"{TASK_SCENARIOS['water_change']['title']} · {meta.get('title') or meta.get('label') or set_id} · {flow_key}",
-        description=description,
-        set_id=set_id,
-        plan=plan,
-        input_kind=meta["input_kind"],
-        input_scale=meta.get("input_scale", "linear"),
-        has_mismatch=self_check and (directory / "mismatch.tif").is_file(),
-        scenarios=runner.SCENARIOS,
-        output_dir=output_dir,
-    )
+    name = f"{TASK_SCENARIOS[task]['title']} · {meta.get('title') or meta.get('label') or set_id} · {flow_key}"
+    if task == "water_extent":
+        spec = build_extent_spec(
+            name=name,
+            description=description,
+            scene_id=(scene_ids or {})["scene"],
+            plan=plan,
+            input_kind=meta["input_kind"],
+            input_scale=meta.get("input_scale", "linear"),
+            scenarios=runner.SCENARIOS,
+            output_dir=output_dir,
+        )
+    else:
+        spec = build_spec(
+            name=name,
+            description=description,
+            set_id=set_id,
+            plan=plan,
+            input_kind=meta["input_kind"],
+            input_scale=meta.get("input_scale", "linear"),
+            has_mismatch=self_check and (directory / "mismatch.tif").is_file(),
+            scenarios=runner.SCENARIOS,
+            output_dir=output_dir,
+            scene_ids=scene_ids,
+        )
     if args.dry_run:
         print(spec)
         return 0
@@ -335,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             "name": flow["name"],
             "description": flow["description"],
             "data": flow["data"],
-            "tags": ["agent-workspace", "water_change"],
+            "tags": ["agent-workspace", task],
         },
     )
     print(
@@ -348,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
                 "node_count": built["node_count"],
                 "edge_count": built["edge_count"],
                 "input_set": set_id,
+                "scenario": task,
+                "scenes": scene_ids,
                 "plan": plan,
             },
             ensure_ascii=False,

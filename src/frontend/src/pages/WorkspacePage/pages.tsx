@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { API, apiJson, useDatasets } from "./api";
+import { API, apiJson, useScenes } from "./api";
 import DataPanel from "./DataPanel";
 import FlowsPanel from "./FlowsPanel";
 import HistoryPanel from "./HistoryPanel";
@@ -9,25 +9,27 @@ import ToolsPanel from "./ToolsPanel";
 import type { HistoryItem } from "./types";
 
 export function DataPage() {
-  const { datasets, refresh } = useDatasets();
+  const { scenes, collections, refresh } = useScenes();
   const navigate = useNavigate();
   return (
     <PageFrame>
       <DataPanel
-        fixtures={datasets}
-        busy={false}
-        onUploaded={async () => refresh()}
-        onUse={(id) => navigate("/workspace?attach=" + encodeURIComponent(id))}
+        scenes={scenes}
+        collections={collections}
+        onUploaded={refresh}
+        onUse={(ids) =>
+          navigate("/workspace?attach=" + ids.map(encodeURIComponent).join(","))
+        }
       />
     </PageFrame>
   );
 }
 
 export function FlowsPage() {
-  const { datasets } = useDatasets();
+  const { scenes } = useScenes();
   return (
     <PageFrame>
-      <FlowsPanel fixtures={datasets} />
+      <FlowsPanel scenes={scenes} />
     </PageFrame>
   );
 }

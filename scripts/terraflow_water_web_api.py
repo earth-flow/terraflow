@@ -77,6 +77,13 @@ _UPLOAD_ID = re.compile(r"^upl_[0-9a-f]{12}$")
 _VALIDATE_RASTER = """
 import json, sys
 import rasterio
+def method(crs):
+    try:
+        from pyproj import CRS
+        operation = CRS.from_user_input(crs).coordinate_operation
+        return operation.method_name if operation is not None else None
+    except Exception:
+        return None
 result = {}
 for path in sys.argv[1:]:
     try:
@@ -85,6 +92,7 @@ for path in sys.argv[1:]:
                 "ok": True,
                 "crs": src.crs.to_string() if src.crs else None,
                 "projected": bool(src.crs and src.crs.is_projected),
+                "projection_method": method(src.crs),
                 "shape": [src.height, src.width],
                 "count": src.count,
                 "dtype": src.dtypes[0],
@@ -118,17 +126,19 @@ def read_json(path: str | Path | None) -> Any:
 
 
 def parse_last_json(output: str) -> dict[str, Any] | None:
+    """The last top-level JSON object in mixed output (objects nested inside it are skipped)."""
     decoder = json.JSONDecoder()
     candidates: list[dict[str, Any]] = []
-    for index, character in enumerate(output):
-        if character != "{":
-            continue
+    index = output.find("{")
+    while index >= 0:
         try:
-            value, _ = decoder.raw_decode(output[index:])
+            value, end = decoder.raw_decode(output, index)
         except json.JSONDecodeError:
+            index = output.find("{", index + 1)
             continue
         if isinstance(value, dict):
             candidates.append(value)
+        index = output.find("{", end)
     return candidates[-1] if candidates else None
 
 
@@ -537,6 +547,23 @@ def canvas_flow_for_input_set(
     return _build_canvas_flow(f"template:{set_id}", ["--input-set", set_id], force=force, token=token)
 
 
+def canvas_template_for_scenes(
+    scenario_id: str, inputs: dict[str, str], *, force: bool = False, token: str | None = None
+) -> tuple[int, dict[str, Any]]:
+    """Create (once) a template canvas flow for a scenario on chosen library scenes."""
+    spec = workspace_scenarios.TASK_SCENARIOS.get(scenario_id)
+    if spec is None:
+        return 404, {"status": "not_found", "error": "场景不存在"}
+    scenes, problem = LIBRARY.check_inputs(spec, inputs)
+    if problem:
+        return 400, {"status": "invalid_request", "error": problem}
+    key = "template:" + scenario_id + ":" + ",".join(scenes[item["role"]]["id"] for item in spec["inputs"])
+    args = ["--scenario", scenario_id] + [
+        part for role, scene in scenes.items() for part in ("--scene", f"{role}={scene['id']}")
+    ]
+    return _build_canvas_flow(key, args, force=force, token=token)
+
+
 def _build_canvas_flow(
     key: str, source_args: list[str], *, force: bool, token: str | None
 ) -> tuple[int, dict[str, Any]]:
@@ -569,6 +596,8 @@ def _build_canvas_flow(
             "canvas_path": result["canvas_path"],
             "name": result.get("name"),
             "input_set": result.get("input_set"),
+            "scenario": result.get("scenario"),
+            "scenes": result.get("scenes"),
             "plan": result.get("plan"),
             "created_at": utc_now(),
         }
@@ -616,7 +645,7 @@ def input_preview(fixture_id: str, role: str) -> Path | None:
     return render_preview(Path(fixture["path"]) / f"{role}.tif", "labels")
 
 
-RUN_PREVIEWS = ("before", "after", "before_mask", "after_mask")
+RUN_PREVIEWS = ("before", "after", "before_mask", "after_mask", "scene", "scene_mask")
 
 
 def run_preview(run_id: str, name: str) -> Path | None:
@@ -762,10 +791,14 @@ def summary_brief(summary: dict[str, Any]) -> dict[str, Any]:
     request = summary.get("request") or {}
     fixtures = summary.get("fixtures") or {}
     model = summary.get("model") or {}
+    scenario = workspace_scenarios.TASK_SCENARIOS.get(str(summary.get("scenario") or "water_change")) or {}
     return {
         "run_id": summary.get("run_id"),
         "created_at": summary.get("created_at"),
         "status": "complete",
+        "scenario": scenario.get("id"),
+        "scenario_title": scenario.get("title"),
+        "input_title": fixtures.get("title") or fixtures.get("label"),
         "prompt": request.get("prompt"),
         "fixture_id": (summary.get("web_request") or {}).get("fixture_id"),
         "fixture_type": fixtures.get("type"),
@@ -1064,6 +1097,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/water-demo/canvas-flows":
             self._send(200, canvas_index())
             return
+        if path == "/api/water-demo/scenes":
+            self._send(200, LIBRARY.catalog())
+            return
         if path == "/api/water-demo/fixtures":
             self._send(200, {"status": "ok", "fixtures": fixture_options()})
             return
@@ -1076,6 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "scenes"] and parts[4] == "preview":
+            self._send_png(LIBRARY.preview(parts[3]))
+            return
         if len(parts) == 6 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "preview":
             self._send_png(input_preview(parts[3], parts[5]))
             return
@@ -1134,8 +1173,10 @@ class Handler(BaseHTTPRequestHandler):
         self._normalize_path()
         if not self._authorized():
             return
-        parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
-        if len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]:
+        parsed = urlsplit(self.path)
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        scene_upload = len(parts) == 5 and parts[:3] == ["api", "water-demo", "scene-uploads"] and parts[4] == "files"
+        if not scene_upload and (len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]):
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})
             return
         try:
@@ -1143,7 +1184,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         filename = unquote(self.headers.get("X-File-Name", "") or "")
-        status, body = store_upload_file(parts[3], parts[4], self.rfile, length, filename)
+        if scene_upload:
+            query = parse_qs(parsed.query)
+            status, body = LIBRARY.store_file(
+                parts[3],
+                self.rfile,
+                length,
+                filename,
+                (query.get("acquired") or [""])[0].strip(),
+                (query.get("label") or [""])[0],
+            )
+        else:
+            status, body = store_upload_file(parts[3], parts[4], self.rfile, length, filename)
         if status != 200:
             # Part of the body may be unread; do not reuse this connection.
             self.close_connection = True
@@ -1171,7 +1223,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 7 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "plans":
             if parts[6] == "execute":
                 payload = self._read_json_body() or {}
-                self._stream(AGENT.execute(parts[3], parts[5], bool(payload.get("self_check"))))
+                inputs = payload.get("inputs")
+                inputs = {str(k): str(v) for k, v in inputs.items()} if isinstance(inputs, dict) else None
+                self._stream(AGENT.execute(parts[3], parts[5], bool(payload.get("self_check")), inputs))
                 return
             if parts[6] == "cancel":
                 updated = AGENT.cancel(parts[3], parts[5])
@@ -1185,6 +1239,16 @@ class Handler(BaseHTTPRequestHandler):
             current = payload.get("current")
             self._send(*resolve_input_set(str(payload["prompt"]), str(current) if current else None))
             return
+        if path == "/api/water-demo/scene-uploads":
+            payload = self._read_json_body()
+            if payload is None:
+                self._send(400, {"status": "invalid_request", "error": "请求体必须是 JSON。"})
+                return
+            self._send(*LIBRARY.create_upload(payload))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "scene-uploads"] and parts[4] == "finalize":
+            self._send(*LIBRARY.finalize(parts[3]))
+            return
         if path == "/api/water-demo/uploads":
             payload = self._read_json_body()
             if payload is None:
@@ -1194,6 +1258,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "uploads"] and parts[4] == "finalize":
             self._send(*finalize_upload(parts[3]))
+            return
+        if path == "/api/water-demo/canvas-templates":
+            payload = self._read_json_body() or {}
+            inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+            self._send(
+                *canvas_template_for_scenes(
+                    str(payload.get("scenario") or ""),
+                    {str(k): str(v) for k, v in inputs.items()},
+                    token=request_token(self.headers),
+                )
+            )
             return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "canvas":
             force = parse_qs(urlsplit(self.path).query).get("force", ["0"])[0] == "1"
@@ -1283,9 +1358,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # Imported here because the agent and scenario modules use the functions above.
+import scene_library  # noqa: E402
 import workspace_agent  # noqa: E402
 import workspace_scenarios  # noqa: E402
 
+LIBRARY = scene_library.SceneLibrary(sys.modules[__name__])
 AGENT = workspace_agent.WorkspaceAgent(sys.modules[__name__])
 
 
@@ -1298,7 +1375,11 @@ def run_result(run_id: str) -> dict[str, Any] | None:
         "run_id": run_id,
         "created_at": summary.get("created_at"),
         "prompt": (summary.get("request") or {}).get("prompt"),
-        "dataset": {key: (summary.get("fixtures") or {}).get(key) for key in ("title", "label", "input_kind", "type")},
+        "dataset": {
+            key: (summary.get("fixtures") or {}).get(key)
+            for key in ("title", "label", "input_kind", "type", "scene_ids")
+        },
+        "scenario": summary.get("scenario") or "water_change",
         "model": (summary.get("model") or {}).get("model_used"),
         "plan": (summary.get("plan") or {}).get("execution_order"),
         "result": workspace_scenarios.build_result(

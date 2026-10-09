@@ -189,11 +189,15 @@ class WorkspaceAgent:
 
     # ---------------------------------------------------------------- context
 
-    def _datasets(self, *, include_developer: bool = True) -> list[dict[str, Any]]:
+    def _scenes(self, *, include_developer: bool = True) -> list[dict[str, Any]]:
+        """Scenes the model may choose from (self-check samples are never offered)."""
         return [
-            {key: option.get(key) for key in ("id", "title", "place", "period", "sensor", "category", "input_kind")}
-            for option in self.web.fixture_options()
-            if include_developer or option.get("audience") != "developer"
+            {
+                key: scene.get(key)
+                for key in ("id", "title", "collection_title", "place", "acquired", "sensor", "input_kind", "category")
+            }
+            for scene in self.web.LIBRARY.scenes()
+            if not scene.get("self_check_for") and (include_developer or scene["audience"] != "developer")
         ]
 
     def _history(self, conversation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -201,7 +205,8 @@ class WorkspaceAgent:
         for message in conversation["messages"][-HISTORY_TURNS:]:
             kind = message.get("kind", "text")
             if kind == "plan":
-                text = f"[提出计划] 场景 {message['plan']['scenario_title']}，数据 {message['plan']['input_title']}，状态 {message.get('status')}"
+                plan = message["plan"]
+                text = f"[提出计划] 场景 {plan['scenario_title']}，数据 {describe_inputs(plan)}，状态 {message.get('status')}"
             elif kind == "run":
                 result = message.get("result") or {}
                 metrics = "；".join(f"{m['label']} {m['value']} {m['unit']}" for m in result.get("metrics") or [])
@@ -214,37 +219,51 @@ class WorkspaceAgent:
     def _last_run(self, conversation: dict[str, Any]) -> dict[str, Any] | None:
         return next((m for m in reversed(conversation["messages"]) if m.get("kind") == "run"), None)
 
+    @staticmethod
+    def _run_scene_ids(message: dict[str, Any] | None) -> list[str]:
+        if not message:
+            return []
+        if message.get("inputs"):
+            return [item["scene_id"] for item in message["inputs"]]
+        # Runs from before the scene library used a before/after input set.
+        legacy = message.get("input_set")
+        return [f"{legacy}.before", f"{legacy}.after"] if legacy else []
+
     # ---------------------------------------------------------------- one turn
 
     def decide(self, conversation: dict[str, Any], content: str, attachments: list[str]) -> dict[str, Any]:
-        datasets = self._datasets()
-        ids = {item["id"] for item in datasets}
+        developer = any(word in content.lower() for word in ("合成", "测试", "synthetic", "test"))
+        offered = self._scenes(include_developer=developer or bool(attachments))
+        by_id = {scene["id"]: scene for scene in self.web.LIBRARY.scenes()}
+        attachments = [item for item in attachments if item in by_id]
+        previous = [item for item in self._run_scene_ids(self._last_run(conversation)) if item in by_id]
         catalog = [
             {key: spec[key] for key in ("id", "title", "summary", "inputs", "input_kinds")}
             for spec in scenarios.scenario_catalog()
         ]
-        last = self._last_run(conversation)
         request = {
             "latest_message": content,
-            "attached_datasets": [item for item in datasets if item["id"] in attachments],
+            "attached_scenes": attachments,
             "conversation": self._history(conversation),
-            "datasets": datasets,
+            "scenes": offered,
             "scenarios": catalog,
-            "previous_run_dataset": last.get("input_set") if last else None,
+            "previous_run_scenes": previous,
             "instructions": [
                 "Decide whether the latest message needs a new analysis run (action=run) or can be answered "
-                "from the conversation, the dataset list and previous results (action=answer).",
-                "Choose run only when the user asks to analyse, compute or compare data and a scenario fits. "
-                "Questions about earlier results, explanations, available data or capabilities are answer.",
-                "input_set: the dataset to analyse - an attached dataset, a dataset the message names (copy the "
-                "naming words exactly into mentioned), or previous_run_dataset when the message refers to the "
-                "same data. null when unknown.",
-                "If the message names a place or event that matches no dataset, set unmatched true.",
+                "from the conversation, the scene list and previous results (action=answer).",
+                "Choose run only when the user asks to analyse, compute, extract or compare data and a scenario "
+                "fits. Questions about earlier results, explanations, available data or capabilities are answer.",
+                "scenario: water_change compares two dates (change, new or receded water, before/after a flood); "
+                "water_extent measures water in one scene (how much water, water extent at one date).",
+                "scenes: ids of the scenes to analyse - attached scenes, scenes the message names (copy the naming "
+                "words exactly into mentioned), or previous_run_scenes when the message refers to the same data. "
+                "Two scenes of the same place for water_change, one for water_extent (use dates in the message).",
+                "If the message names a place or event that matches no scene, set unmatched true.",
             ],
             "return_schema": {
                 "action": "answer or run",
                 "scenario": "scenario id or null",
-                "input_set": "dataset id or null",
+                "scenes": ["scene id"],
                 "mentioned": "exact words from the message, or null",
                 "unmatched": False,
             },
@@ -252,37 +271,47 @@ class WorkspaceAgent:
         parsed = self._llm_json(request)
         action = "run" if parsed.get("action") == "run" else "answer"
         scenario = parsed.get("scenario") if parsed.get("scenario") in scenarios.TASK_SCENARIOS else None
+        if action == "run" and scenario is None:
+            scenario = "water_change" if len(attachments) == 2 else next(iter(scenarios.TASK_SCENARIOS))
         mentioned = parsed.get("mentioned") if isinstance(parsed.get("mentioned"), str) else None
         mentioned = mentioned.strip() if mentioned and mentioned.strip() in content else None
-        chosen = parsed.get("input_set") if parsed.get("input_set") in ids else None
-        by_id = {option["id"]: option for option in self.web.fixture_options()}
-        # Accept the model's dataset only when it is grounded: attached, named in
-        # the message (checked against the dataset description), or the previous run's.
-        grounded = (
-            chosen in attachments
-            or (chosen and mentioned and self.web._mentions_candidate(mentioned, by_id[chosen]))
-            or (chosen and last and chosen == last.get("input_set"))
+        chosen = [item for item in parsed.get("scenes") or [] if isinstance(item, str) and item in by_id]
+        # Keep the model's scenes only when grounded: attached, named in the message
+        # (checked against the scene description), or used by the previous run.
+        grounded, source = [], None
+        for item in chosen:
+            if item in attachments:
+                grounded.append(item)
+                source = source or "attachment"
+            elif mentioned and mentions_scene(mentioned, by_id[item]):
+                grounded.append(item)
+                source = source or "message"
+            elif item in previous:
+                grounded.append(item)
+                source = source or "previous_run"
+        if not grounded and attachments:
+            grounded, source = list(attachments), "attachment"
+        matched_collections = (
+            {scene["collection_id"] for scene in by_id.values() if mentions_scene(mentioned, scene)} if mentioned else set()
         )
-        source = None
-        if grounded:
-            source = "attachment" if chosen in attachments else ("message" if mentioned else "previous_run")
-        else:
-            chosen = None
-        if chosen is None and attachments:
-            chosen = next((item for item in attachments if item in ids), None)
-            source = "attachment" if chosen else None
-        if chosen is None and any(word in content.lower() for word in ("合成", "synthetic")):
-            chosen = next(
-                (option["id"] for option in self.web.fixture_options() if option.get("category") == "synthetic"), None
+        if not grounded and matched_collections:
+            source = "message"
+        if not grounded and not matched_collections and developer:
+            synthetic = [s["id"] for s in by_id.values() if s["category"] == "synthetic" and not s.get("self_check_for")]
+            grounded, source = synthetic, ("keyword" if synthetic else None)
+        roles, notes = {}, []
+        if action == "run" and scenario:
+            roles, notes = assign_roles(
+                scenarios.TASK_SCENARIOS[scenario], grounded, matched_collections, by_id, content
             )
-            source = "keyword" if chosen else None
         return {
             "action": action,
-            "scenario": scenario or (next(iter(scenarios.TASK_SCENARIOS)) if action == "run" else None),
-            "input_set": chosen,
+            "scenario": scenario,
+            "roles": roles,
+            "notes": notes,
             "mentioned": mentioned,
-            "matched_by": source,
-            "unmatched": bool(parsed.get("unmatched")) and chosen is None and bool(mentioned),
+            "matched_by": source if roles else None,
+            "unmatched": bool(parsed.get("unmatched")) and not roles and bool(mentioned) and not matched_collections,
         }
 
     def handle_message(self, conversation_id: str, content: str, attachments: list[str]) -> Iterator[Event]:
@@ -309,21 +338,25 @@ class WorkspaceAgent:
 
     def _propose(self, conversation_id: str, content: str, decision: dict[str, Any]) -> Iterator[Event]:
         spec = scenarios.TASK_SCENARIOS[decision["scenario"]]
-        if decision["input_set"] is None:
+        needed = [item["role"] for item in spec["inputs"]]
+        if any(role not in decision["roles"] for role in needed):
             if decision["unmatched"]:
                 text = (
                     f"现有数据里没有「{decision['mentioned']}」。可以到“数据”上传对应影像，"
-                    f"或者用“＋ 添加数据”选一组现有数据再试。"
+                    f"或者用“＋ 添加数据”选择现有影像再试。"
                 )
             else:
                 needs = "、".join(item["label"] for item in spec["inputs"])
-                text = f"要运行「{spec['title']}」，需要指定一组数据（{needs}）。请用“＋ 添加数据”选择，或在任务里说明地点。"
+                text = (
+                    f"要运行「{spec['title']}」，需要指定{needs}。请用“＋ 添加数据”选择影像，或在任务里说明地点和日期。"
+                )
             yield from self._say(conversation_id, text)
             return
-        dataset = self.web.resolve_fixture(decision["input_set"])
-        if dataset["input_kind"] not in spec["input_kinds"]:
-            yield from self._say(conversation_id, f"「{dataset['title']}」的数据类型不适用于「{spec['title']}」。")
+        scenes, problem = self.web.LIBRARY.check_inputs(spec, decision["roles"])
+        if problem:
+            yield from self._say(conversation_id, problem)
             return
+        first = next(iter(scenes.values()))
         yield "status", {"text": "正在规划工具顺序…"}
         runner = self.web._RUNNER
         try:
@@ -331,11 +364,17 @@ class WorkspaceAgent:
             _, tools = runner.discover_catalog(runner.DEFAULT_TERRABOX_URL, api_key)
             model = runner.detect_model(runner.DEFAULT_LLM_URL, runner.DEFAULT_REQUESTED_MODEL)
             plan = runner.plan_with_model(
-                runner.DEFAULT_LLM_URL, model, tools, user_prompt=content, input_kind=dataset["input_kind"]
+                runner.DEFAULT_LLM_URL,
+                model,
+                tools,
+                user_prompt=content,
+                input_kind=first["input_kind"],
+                task=spec["id"],
             )
         except runner.DemoError as exc:
             yield from self._say(conversation_id, f"没能生成可执行的计划：{exc}")
             return
+        inputs = plan_inputs(spec, scenes)
         message = self.store.append(
             conversation_id,
             {
@@ -344,20 +383,21 @@ class WorkspaceAgent:
                 "status": "pending",
                 "content": plan.get("reason") or "",
                 "request": content,
-                "input_set": dataset["id"],
                 "plan": {
                     "scenario": spec["id"],
                     "scenario_title": spec["title"],
-                    "input_set": dataset["id"],
-                    "input_title": dataset["title"],
-                    "input_kind": dataset["input_kind"],
-                    "has_self_check_sample": bool(dataset.get("has_mismatch")),
+                    "inputs": inputs,
+                    "input_title": describe_inputs({"inputs": inputs}),
+                    "input_kind": first["input_kind"],
+                    "input_scale": first.get("input_scale"),
+                    "self_check_available": spec["id"] == "water_change",
                     "execution_order": plan["execution_order"],
                     "removed_duplicates": plan.get("removed_duplicates") or [],
                     "reason": plan.get("reason"),
                     "model": model["model_used"],
                     "matched_by": decision.get("matched_by"),
                     "mentioned": decision.get("mentioned"),
+                    "notes": decision.get("notes") or [],
                 },
             },
         )
@@ -372,9 +412,10 @@ class WorkspaceAgent:
                 for spec in scenarios.scenario_catalog()
             ],
             # Test fixtures and test uploads are not offered to users unless they ask for them.
-            "datasets": self._datasets(include_developer=any(w in content for w in ("合成", "测试", "开发"))),
+            "scenes": self._scenes(include_developer=any(w in content for w in ("合成", "测试", "开发"))),
             "latest_result": {
-                "dataset": last.get("input_title"),
+                "scenario": last.get("scenario"),
+                "data": last.get("input_title"),
                 "headline": (last.get("result") or {}).get("headline"),
                 "metrics": (last.get("result") or {}).get("metrics"),
                 "boundaries": (last.get("result") or {}).get("boundaries"),
@@ -399,8 +440,8 @@ class WorkspaceAgent:
             for delta in self._llm_stream(messages):
                 text += delta
                 yield "token", {"text": delta}
-        except OSError as exc:
-            text += f"\n（回答中断：{exc}）"
+        except (OSError, RuntimeError):  # RuntimeError covers the runner's DemoError
+            text += "\n（模型服务暂时不可用，回答没有完成。）"
         warnings = unsupported_numbers(
             text, facts_text + " " + content + " " + json.dumps(self._history(conversation), ensure_ascii=False)
         )
@@ -420,7 +461,9 @@ class WorkspaceAgent:
             return None
         return self.store.update(conversation_id, message_id, status="cancelled")
 
-    def execute(self, conversation_id: str, message_id: str, self_check: bool) -> Iterator[Event]:
+    def execute(
+        self, conversation_id: str, message_id: str, self_check: bool, inputs: dict[str, str] | None = None
+    ) -> Iterator[Event]:
         if not _MESSAGE_ID.fullmatch(message_id):
             yield "error", {"text": "计划不存在。"}
             return
@@ -432,14 +475,38 @@ class WorkspaceAgent:
         if plan_message.get("status") != "pending":
             yield "error", {"text": "这个计划已经执行或取消过了。"}
             return
+        plan = plan_message["plan"]
+        if "inputs" not in plan:
+            yield "error", {"text": "这是旧版计划，请重新提问生成新计划。"}
+            return
+        spec = scenarios.TASK_SCENARIOS[plan["scenario"]]
+        roles = {item["role"]: item["scene_id"] for item in plan["inputs"]}
+        changed = bool(inputs) and any(inputs.get(role, roles[role]) != roles[role] for role in roles)
+        if changed:
+            roles = {role: str(inputs.get(role) or roles[role]) for role in roles}
+        scenes, problem = self.web.LIBRARY.check_inputs(spec, roles)
+        if problem:
+            yield "error", {"text": problem}
+            return
+        first = next(iter(scenes.values()))
+        if (first["input_kind"], first.get("input_scale")) != (plan["input_kind"], plan.get("input_scale")):
+            # The confirmed tool order depends on the data kind; a different kind needs a new plan.
+            yield "error", {"text": "更换后的影像与计划的数据类型不同，请重新提问生成计划。"}
+            return
         if not self.web._RUN_LOCK.acquire(blocking=False):
             yield "error", {"text": "已有任务在运行，请稍后再执行。"}
             return
+        if changed:
+            inputs_list = plan_inputs(spec, scenes)
+            plan = {**plan, "inputs": inputs_list, "input_title": describe_inputs({"inputs": inputs_list}),
+                    "inputs_changed_by_user": True}
+            self.store.update(conversation_id, message_id, plan=plan)
+            plan_message = {**plan_message, "plan": plan}
         self.store.update(conversation_id, message_id, status="running")
         events: queue.Queue[Event | None] = queue.Queue()
         worker = threading.Thread(
             target=self._execute_worker,
-            args=(conversation_id, plan_message, self_check, events),
+            args=(conversation_id, plan_message, scenes, self_check, events),
             daemon=True,
             name=f"workspace-run-{message_id}",
         )
@@ -451,12 +518,21 @@ class WorkspaceAgent:
             yield item
 
     def _execute_worker(
-        self, conversation_id: str, plan_message: dict[str, Any], self_check: bool, events: queue.Queue
+        self,
+        conversation_id: str,
+        plan_message: dict[str, Any],
+        scenes: dict[str, dict[str, Any]],
+        self_check: bool,
+        events: queue.Queue,
     ) -> None:
         """Runs in its own thread so a closed browser tab does not lose the result."""
         plan = plan_message["plan"]
         try:
-            dataset = self.web.resolve_fixture(plan["input_set"])
+            if self_check and plan["scenario"] == "water_change":
+                events.put(("status", {"text": "正在准备门控自检样本…"}))
+            input_dir, self_check_ready = self.web.LIBRARY.prepare_inputs(
+                plan["scenario"], scenes, plan_message["id"], self_check
+            )
             job_dir = self.web.JOB_DIR
             plan_file = job_dir / f"{plan_message['id']}.plan.json"
             events_file = job_dir / f"{plan_message['id']}.events.jsonl"
@@ -469,14 +545,16 @@ class WorkspaceAgent:
                 str(self.web.RUNNER),
                 "--prompt",
                 plan_message.get("request") or "",
+                "--task",
+                plan["scenario"],
                 "--fixtures-dir",
-                str(dataset["path"]),
+                str(input_dir),
                 "--plan-file",
                 str(plan_file),
                 "--events-file",
                 str(events_file),
             ]
-            if self_check and dataset.get("has_mismatch"):
+            if self_check_ready:
                 command.append("--self-check")
             events.put(("status", {"text": "开始执行"}))
             process = subprocess.Popen(
@@ -513,7 +591,7 @@ class WorkspaceAgent:
             summary["web_request"] = {
                 "prompt": plan_message.get("request"),
                 "entrypoint": "agent-workspace",
-                "fixture_id": dataset["id"],
+                "scenes": {role: scene["id"] for role, scene in scenes.items()},
                 "conversation_id": conversation_id,
                 "plan_message_id": plan_message["id"],
                 "self_check": bool(self_check),
@@ -544,8 +622,8 @@ class WorkspaceAgent:
                     explanation += delta
                     events.put(("token", {"text": delta}))
                 warnings = unsupported_numbers(explanation, facts_text + " " + (plan_message.get("request") or ""))
-            except OSError as exc:
-                explanation += f"（解读中断：{exc}）"
+            except (OSError, RuntimeError):  # the run succeeded; only the explanation is missing
+                explanation += "（模型服务暂时不可用，没有生成解读；结果以上方卡片为准。）"
             message = self.store.append(
                 conversation_id,
                 {
@@ -553,8 +631,8 @@ class WorkspaceAgent:
                     "kind": "run",
                     "run_id": run_id,
                     "plan_message_id": plan_message["id"],
-                    "input_set": dataset["id"],
-                    "input_title": dataset["title"],
+                    "inputs": plan["inputs"],
+                    "input_title": plan["input_title"],
                     "scenario": plan["scenario"],
                     "result": result,
                     "content": explanation,
@@ -575,6 +653,101 @@ class WorkspaceAgent:
         finally:
             self.web._RUN_LOCK.release()
             events.put(None)
+
+
+_MONTH_DAY = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日?")
+_ISO_DATE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+
+
+def mentions_scene(mentioned: str | None, scene: dict[str, Any]) -> bool:
+    """True when the quoted words share a two-character piece with the scene or its collection."""
+    if not mentioned:
+        return False
+    text = " ".join(
+        str(scene.get(key) or "") for key in ("title", "collection_title", "place", "event", "acquired")
+    ).lower()
+    words = mentioned.lower()
+    pieces = {words[index : index + 2] for index in range(len(words) - 1)}
+    return any(piece.strip() and len(piece.strip()) == 2 and piece in text for piece in pieces)
+
+
+def mentioned_dates(content: str) -> set[tuple[int, int]]:
+    dates = {(int(m), int(d)) for m, d in _MONTH_DAY.findall(content)}
+    dates |= {(int(m), int(d)) for _, m, d in _ISO_DATE.findall(content)}
+    return dates
+
+
+def _order_key(scene: dict[str, Any]) -> tuple[str, int]:
+    return (str(scene.get("acquired") or ""), int(scene.get("sequence") or 0))
+
+
+def assign_roles(
+    spec: dict[str, Any],
+    chosen: list[str],
+    collections: set[str],
+    by_id: dict[str, dict[str, Any]],
+    content: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Fill the scenario's input roles from grounded scenes; earlier scenes come first."""
+    notes: list[str] = []
+    pool = [by_id[item] for item in dict.fromkeys(chosen)]
+    roles = [item["role"] for item in spec["inputs"]]
+    if len(pool) < len(roles):
+        # Complete from the same collections, users' scenes only, same data kind.
+        groups = collections | {scene["collection_id"] for scene in pool}
+        kinds = {scene["input_kind"] for scene in pool}
+        extra = [
+            scene for scene in by_id.values()
+            if scene["collection_id"] in groups
+            and not scene.get("self_check_for")
+            and scene["audience"] == "user"
+            and (not kinds or scene["input_kind"] in kinds)
+            and scene not in pool
+        ]
+        if len(roles) == 1 and not pool and extra:
+            dates = mentioned_dates(content)
+            dated = [s for s in extra if s.get("acquired") and (int(s["acquired"][5:7]), int(s["acquired"][8:10])) in dates]
+            if dated:
+                pool = dated[:1]
+            else:
+                pool = [max(extra, key=_order_key)]
+                if len(extra) > 1:
+                    notes.append("任务没有指明日期，默认用日期最新的一景，可以在卡片里更换。")
+        else:
+            pool += sorted(extra, key=_order_key)[: len(roles) - len(pool)]
+    if len(pool) > len(roles):
+        notes.append(f"候选影像有 {len(pool)} 景，计划只用其中 {len(roles)} 景，可以在卡片里更换。")
+        pool = pool[: len(roles)]
+    if len(pool) < len(roles):
+        return {}, notes
+    pool.sort(key=_order_key)
+    if len(roles) == 2 and not all(scene.get("acquired") for scene in pool):
+        notes.append("有影像缺少成像日期，前后期按上传顺序确定，请在卡片里核对。")
+    return {role: scene["id"] for role, scene in zip(roles, pool)}, notes
+
+
+def plan_inputs(spec: dict[str, Any], scenes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": item["role"],
+            "label": item["label"],
+            "scene_id": scenes[item["role"]]["id"],
+            "scene_title": scenes[item["role"]]["title"],
+            "collection_title": scenes[item["role"]]["collection_title"],
+            "acquired": scenes[item["role"]].get("acquired"),
+            "preview": scenes[item["role"]].get("preview"),
+        }
+        for item in spec["inputs"]
+    ]
+
+
+def describe_inputs(plan: dict[str, Any]) -> str:
+    inputs = plan.get("inputs") or []
+    if not inputs:
+        return str(plan.get("input_title") or "")
+    collections = {item.get("collection_title") for item in inputs}
+    dates = "、".join(f"{item.get('acquired') or item['scene_title']}（{item['label']}）" for item in inputs)
+    return f"{collections.pop()} · {dates}" if len(collections) == 1 else dates
 
 
 def translate_event(event: dict[str, Any]) -> Event | None:

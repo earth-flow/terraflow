@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import type { FixtureOption } from "./types";
+import type { Collection, Scene } from "./types";
 
 export const API = "/api/workspace";
 
@@ -72,15 +72,18 @@ export async function readEvents(
   }
 }
 
-export function useDatasets() {
-  const [datasets, setDatasets] = useState<FixtureOption[]>([]);
+export function useScenes() {
+  const [scenes, setScenes] = useState<Scene[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
   const [error, setError] = useState("");
   const refresh = useCallback(async () => {
     try {
-      const body = await apiJson<{ fixtures: FixtureOption[] }>(
-        API + "/fixtures",
-      );
-      setDatasets(body.fixtures);
+      const body = await apiJson<{
+        scenes: Scene[];
+        collections: Collection[];
+      }>(API + "/scenes");
+      setScenes(body.scenes);
+      setCollections(body.collections);
       setError("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法读取数据列表。");
@@ -89,7 +92,25 @@ export function useDatasets() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
-  return { datasets, error, refresh };
+  return { scenes, collections, error, refresh };
+}
+
+/** Scenes a user picks from: no self-check samples, developer data only on request. */
+export function pickableScenes(scenes: Scene[], showDeveloper: boolean) {
+  return scenes.filter(
+    (scene) =>
+      !scene.self_check_for &&
+      (showDeveloper || scene.audience !== "developer"),
+  );
+}
+
+export function sceneFacts(scene: Scene) {
+  return [
+    scene.acquired,
+    scene.sensor,
+    scene.kind_label,
+    scene.area_km2 ? "约 " + scene.area_km2.toFixed(0) + " km²" : null,
+  ].filter(Boolean) as string[];
 }
 
 export function displayTool(slug: string) {

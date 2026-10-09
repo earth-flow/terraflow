@@ -40,10 +40,10 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 | 页面 | 路径 | 内容 |
 | --- | --- | --- |
-| 对话 | `/workspace`、`/workspace/c/:id` | 左侧会话列表；中间消息流；底部输入框，可用“＋ 添加数据”附加数据集 |
-| 数据 | `/workspace/data` | 数据集卡片、来源、上传；“用这组数据对话”会带着该数据打开对话 |
+| 对话 | `/workspace`、`/workspace/c/:id` | 左侧会话列表；中间消息流；底部输入框，可用“＋ 添加数据”附加一到四景影像 |
+| 数据 | `/workspace/data` | 按组列出的单景影像、来源、上传（一景或多景）；“用这景/这一组对话”会带着这些影像打开对话 |
 | 场景 | `/workspace/scenarios` | 已注册场景的输入、输出、工具和限制 |
-| Flow | `/workspace/flows` | 带 `agent-workspace` 标签的 flow（旧的按名称前缀兼容） |
+| Flow | `/workspace/flows` | 带 `agent-workspace` 标签的 flow（旧的按名称前缀兼容）；可选场景和影像生成模板 flow |
 | 工具 | `/workspace/tools` | Terrabox 工具目录、可用状态、被哪些场景使用、按输入类型的参数预设 |
 | 运行记录 | `/workspace/runs`、`/workspace/runs/:id` | 历史运行与通用结果详情 |
 
@@ -52,13 +52,13 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 ### 一轮对话
 
 1. 用户消息先由规划模型判断：直接回答（基于对话、数据目录、场景说明和上一次结果），还是提出运行。
-2. 提出运行时，先确定数据：附加的数据集、消息中原文提到且与数据描述一致的数据集、或上一次运行用过的数据集；都没有时请用户指定。然后生成计划卡片（场景、数据及其来源、工具顺序、说明），等待用户点“执行”。
+2. 提出运行时，先确定场景和影像：附加的影像、消息中原文提到且与影像或所属组描述一致的影像、或上一次运行用过的影像；不够时从同一组中补足（单景场景优先用消息里的日期，否则用最新一景并提示）；都没有时请用户指定。影像按成像日期排列后填入场景的角色（水体变化：前期、后期；单景水体提取：影像）。然后生成计划卡片（每个角色的影像及来源、工具顺序、说明），用户可在卡片里更换同类型的影像，点“执行”后才运行。
 3. 执行时 runner 读取确认过的计划（`--plan-file`，重新校验顺序规则但不重新规划），逐步写事件（`--events-file`）；适配层把阶段和每个工具的开始/完成推送给页面。完成后按场景生成统一结果（标题句、数值、图层与图例、网格检查、门控自检、适用边界），再流式输出一段基于结果的解读。
 4. 回答和解读中的数字会与给定事实核对（允许四舍五入以及比例、百分比和差值），不在其中的会提示“以结果卡片中的数值为准”。
 
 ### 场景注册
 
-`scripts/workspace_scenarios.py` 的 `TASK_SCENARIOS` 声明每个场景的输入、要求、输出、工具、限制、示例和结果构建函数。页面只渲染统一结果，新增场景不需要新的前端组件。目前注册了“水体变化”。
+`scripts/workspace_scenarios.py` 的 `TASK_SCENARIOS` 声明每个场景的输入、要求、输出、工具、限制、示例和结果构建函数。页面只渲染统一结果，新增场景不需要新的前端组件。目前注册了“水体变化”（两景）和“单景水体提取”（一景）。runner 用 `--task water_change|water_extent` 选择执行链，两者共用工具顺序校验和输入类型预设。
 
 ### 流式接口
 
@@ -70,9 +70,29 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 | GET/POST | `/conversations` | 会话列表（不含空会话）/ 新建 |
 | GET/DELETE | `/conversations/{id}` | 读取 / 删除会话（不删除运行结果和 flow） |
 | POST | `/conversations/{id}/messages` | 发送消息，流式返回回答或计划 |
-| POST | `/conversations/{id}/plans/{message_id}/execute` | 执行计划（body `{self_check}`），流式返回步骤、结果和解读 |
+| POST | `/conversations/{id}/plans/{message_id}/execute` | 执行计划（body `{self_check, inputs}`，`inputs` 为执行前更换的 `{角色: 景 id}`，只能换成同类型影像），流式返回步骤、结果和解读 |
 | POST | `/conversations/{id}/plans/{message_id}/cancel` | 取消计划 |
 | GET | `/runs/{run_id}/result` | 通用结果 |
+| GET | `/scenes` | 景库：`scenes` 与 `collections` |
+| GET | `/scenes/{scene_id}/preview` | 单景预览 PNG |
+| POST | `/scene-uploads` | 新建上传（组名、地点、传感器、数据类型、尺度） |
+| PUT | `/scene-uploads/{id}/files?acquired=&label=` | 上传一景（请求体为文件，`X-File-Name` 为原文件名） |
+| POST | `/scene-uploads/{id}/finalize` | 检查坐标系和波段，完成上传 |
+| POST | `/canvas-templates` | 为场景和所选影像生成模板 flow（body `{scenario, inputs}`） |
+
+## 景库（2026-10-09 起）
+
+数据以“景”为单位：一景是一幅单波段栅格及其成像日期、传感器、数据类型、地点和来源；同一事件或同一次上传的几景归为一组。角色不随数据保存，由计划在使用时指定。`scripts/scene_library.py` 汇总三处数据，都不移动原文件：
+
+| 来源 | 位置 | 读作 |
+| --- | --- | --- |
+| 早先的成对输入组合 | `runtime/demo-fixtures/`、`runtime/web-uploads/` | 每对读作一组两景（`<组>.before`、`<组>.after`），`mismatch.tif` 读作开发者数据中的自检样本 |
+| 按景上传 | `runtime/scene-uploads/sup_*/` | `batch.json` 记录组信息和每景的原文件名、成像日期、说明、大小、sha256 和栅格检查结果 |
+| 自检样本 | `runtime/self-check/<id>/` | 勾选门控自检时，由后期影像裁掉右侧 50 列生成一次，记录来源景 |
+
+运行前，适配层在 `runtime/run-inputs/<计划消息 id>/` 中按 runner 需要的文件名建立符号链接（`before.tif`/`after.tif`，或 `scene.tif`），并写入由各景元数据组成的 `fixture.json`（含 `scene_ids`）。`runtime/scene-index.json` 列出每景的路径，供 Canvas 的 Scene Input 组件选择。
+
+面积统计只在投影坐标、长度单位、且不随纬度放大面积的网格上进行：`geo_water.water_evidence` 与 `geo_water.water_extent` 共用同一检查，地理坐标（`unsupported_area_crs`）和 Web Mercator 等 Mercator 投影（`area_distorting_projection`）会被拦截；UTM（横轴墨卡托）不受影响。数据卡片上的“约 X km²”对这类网格同样不显示。
 
 ## 页面能展示什么
 
@@ -89,7 +109,7 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 ## 输入组合
 
-输入组合来自两个目录，每个目录必须包含 `before.tif` 和 `after.tif`，`mismatch.tif` 可选（只用于门控自检）。目录中的 `fixture.json` 说明输入类型和来源；没有这个文件的 `demo-fixtures/` 根目录按合成 0/1 水体标签处理。
+以下是 N033 之前的成对数据格式；现在它们由景库读作每组两景，命令行 runner 和旧的 Canvas 模板仍可直接使用。输入组合来自两个目录，每个目录必须包含 `before.tif` 和 `after.tif`，`mismatch.tif` 可选（只用于门控自检）。目录中的 `fixture.json` 说明输入类型和来源；没有这个文件的 `demo-fixtures/` 根目录按合成 0/1 水体标签处理。
 
 | 来源 | 位置 | 说明 |
 | --- | --- | --- |
@@ -169,7 +189,10 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 flow 由 `scripts/build_water_flow.py` 生成（需要 Terraflow 虚拟环境里的 lfx）：读取运行摘要中经过 runner 校验的工具顺序，按 runner 的 `SCENARIOS` 预设填参数，用 lfx 自带的 `build_flow_from_spec` 和线上组件目录拼成 flow，再通过 `POST /api/v1/flows/` 保存。也可以不依赖运行，直接为某个输入组合生成模板：
 
 ```bash
-.venv/bin/python scripts/build_water_flow.py --input-set thessaly_2023_s1           # 模板
+.venv/bin/python scripts/build_water_flow.py --scenario water_extent --scene scene=thessaly_2023_s1.after   # 景库模板
+.venv/bin/python scripts/build_water_flow.py --scenario water_change \
+    --scene before=thessaly_2023_s1.before --scene after=thessaly_2023_s1.after                   # 景库模板
+.venv/bin/python scripts/build_water_flow.py --input-set thessaly_2023_s1           # 旧的输入组合模板
 .venv/bin/python scripts/build_water_flow.py --run-id 20261008_154450_c502d2       # 来自一次运行
 .venv/bin/python scripts/build_water_flow.py --input-set demo-fixtures --dry-run   # 只打印规格
 ```
@@ -178,12 +201,13 @@ flow 里的节点都是真实组件：
 
 | 节点 | 来源 | 作用 |
 | --- | --- | --- |
-| Water Input Set | `lfx/components/geo_workflow`（Geo Workflow 类别） | 选择 `$TERRAFLOW_WATER_RUNTIME_DIR` 下的输入组合，输出前后影像和拒绝样本路径；没有拒绝样本时停止该分支 |
+| Scene Input | `lfx/components/geo_workflow`（Geo Workflow 类别） | 从 `$TERRAFLOW_WATER_RUNTIME_DIR/scene-index.json` 选择一景，输出路径和元数据；每个角色一个节点（前期、后期、自检样本或单景） |
+| Water Input Set | 同上 | 旧的成对输入组合，N033 之前的运行和 `--input-set` 模板使用 |
 | Raster Pair Gate | 同上 | 读取 Raster Profile Preflight 的结果；不通过时停止前后路径两个输出，下游成对分析不执行，Decision 输出原因 |
 | Tool Result Field | 同上 | 从 Terrabox 工具结果中取出 `outputs.output_path`、`outputs.threshold` 等字段，交给下一个工具 |
-| Inspect GeoTIFF、Raster Profile Preflight、Threshold Segmentation、Raster Difference、Water Label Evidence、Pixel → Area | Terrabox 自动生成的组件 | 与 runner 调用的是同一组 Terrabox 工具 |
+| Inspect GeoTIFF、Raster Profile Preflight、Threshold Segmentation、Raster Difference、Water Label Evidence、Water Label Extent、Pixel → Area | Terrabox 自动生成的组件 | 与 runner 调用的是同一组 Terrabox 工具 |
 
-SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu，求出的阈值经 Tool Result Field 传给前期影像，与 runner 的规则一致。只有做过门控自检的运行（或模板加 `--self-check`）生成的 flow 才带拒绝分支，其中的 Water Label Evidence 在门控拦截后不会执行。
+单景水体提取的 flow 是 Scene Input → Threshold Segmentation（SAR 时，Otsu）→ Water Label Extent，面积检查在 Water Label Extent 中进行。水体变化 SAR 输入时，flow 中有两个 Threshold Segmentation：后期影像用 Otsu，求出的阈值经 Tool Result Field 传给前期影像，与 runner 的规则一致。只有做过门控自检的运行（或模板加 `--self-check`）生成的 flow 才带拒绝分支，其中的 Water Label Evidence 在门控拦截后不会执行。
 
 后端需要设置 `TERRAFLOW_WATER_RUNTIME_DIR`（Water Input Set 用它列出输入组合）。新组件已写入 `src/lfx/src/lfx/_assets/component_index.json`，生产模式无需 `LFX_DEV`。
 

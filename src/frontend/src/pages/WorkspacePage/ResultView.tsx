@@ -216,7 +216,7 @@ export default function ResultView({
             }
             title={result.gate.description}
           >
-            网格检查：
+            {result.gate.label ?? "门控检查"}：
             {result.gate.passed
               ? "通过"
               : "拦截（" + (result.gate.reason_code ?? "") + "）"}

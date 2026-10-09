@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from lfx.components.geo_workflow.raster_pair_gate import RasterPairGateComponent, preflight_outputs
+from lfx.components.geo_workflow.scene_input import SceneInputComponent, read_scene_index
 from lfx.components.geo_workflow.tool_result_field import read_field
 from lfx.components.geo_workflow.water_input_set import list_input_sets, read_set_metadata
 from lfx.schema.data import Data
@@ -70,3 +71,27 @@ def test_list_input_sets_finds_fixtures_and_finalized_uploads(tmp_path, monkeypa
 def test_list_input_sets_without_runtime_dir(monkeypatch):
     monkeypatch.delenv("TERRAFLOW_WATER_RUNTIME_DIR", raising=False)
     assert list_input_sets() == {}
+
+
+def test_scene_input_reads_the_workspace_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERRAFLOW_WATER_RUNTIME_DIR", str(tmp_path))
+    raster = tmp_path / "scene.tif"
+    raster.write_bytes(b"II*\x00")
+    (tmp_path / "scene-index.json").write_text(
+        '{"a.after": {"path": "%s", "title": "2023-09-13", "input_kind": "sar_backscatter"},'
+        ' "broken": {"title": "no path"}}' % raster,
+        encoding="utf-8",
+    )
+    assert list(read_scene_index()) == ["a.after"]
+    component = SceneInputComponent()
+    component.set(scene_id="a.after")
+    assert component.path_message().text == str(raster)
+    assert component.metadata_data().data["input_kind"] == "sar_backscatter"
+    component.set(scene_id="missing")
+    with pytest.raises(ValueError, match="not in the workspace"):
+        component.path_message()
+
+
+def test_scene_index_without_runtime_dir(monkeypatch):
+    monkeypatch.delenv("TERRAFLOW_WATER_RUNTIME_DIR", raising=False)
+    assert read_scene_index() == {}

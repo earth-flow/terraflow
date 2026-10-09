@@ -74180,6 +74180,119 @@
           },
           "tool_mode": false
         },
+        "SceneInput": {
+          "base_classes": [
+            "JSON",
+            "Message"
+          ],
+          "beta": false,
+          "conditional_paths": [],
+          "custom_fields": {},
+          "description": "Select one raster scene from the workspace data library.",
+          "display_name": "Scene Input",
+          "documentation": "",
+          "edited": false,
+          "field_order": [
+            "scene_id"
+          ],
+          "frozen": false,
+          "icon": "Image",
+          "legacy": false,
+          "metadata": {
+            "code_hash": "0dcad28b0735",
+            "dependencies": {
+              "dependencies": [
+                {
+                  "name": "lfx",
+                  "version": null
+                }
+              ],
+              "total_dependencies": 1
+            },
+            "module": "lfx.components.geo_workflow.scene_input.SceneInputComponent"
+          },
+          "minimized": false,
+          "output_types": [],
+          "outputs": [
+            {
+              "allows_loop": false,
+              "cache": true,
+              "display_name": "Raster Path",
+              "group_outputs": true,
+              "method": "path_message",
+              "name": "path",
+              "selected": "Message",
+              "tool_mode": true,
+              "types": [
+                "Message"
+              ],
+              "value": "__UNDEFINED__"
+            },
+            {
+              "allows_loop": false,
+              "cache": true,
+              "display_name": "Scene Metadata",
+              "group_outputs": true,
+              "method": "metadata_data",
+              "name": "metadata",
+              "selected": "JSON",
+              "tool_mode": true,
+              "types": [
+                "JSON"
+              ],
+              "value": "__UNDEFINED__"
+            }
+          ],
+          "pinned": false,
+          "template": {
+            "_type": "Component",
+            "code": {
+              "advanced": true,
+              "dynamic": true,
+              "fileTypes": [],
+              "file_path": "",
+              "info": "",
+              "list": false,
+              "load_from_db": false,
+              "multiline": true,
+              "name": "code",
+              "password": false,
+              "placeholder": "",
+              "required": true,
+              "show": true,
+              "title_case": false,
+              "type": "code",
+              "value": "\"\"\"Choose one scene from the workspace scene library.\n\nThe workspace lists every scene (observed, uploaded, synthetic and gate\nself-check samples) in ``$TERRAFLOW_WATER_RUNTIME_DIR/scene-index.json``.\nA flow uses one Scene Input per role, so a change analysis has a before and\nan after scene and a single-scene analysis has one; the role is decided by\nthe flow, not stored with the data.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nfrom pathlib import Path\nfrom typing import Any\n\nfrom lfx.custom.custom_component.component import Component\nfrom lfx.io import DropdownInput, Output\nfrom lfx.schema.data import Data\nfrom lfx.schema.message import Message\n\nRUNTIME_DIR_ENV = \"TERRAFLOW_WATER_RUNTIME_DIR\"\nINDEX_NAME = \"scene-index.json\"\n\n\ndef read_scene_index() -> dict[str, dict[str, Any]]:\n    \"\"\"Return {scene_id: record} from the workspace index; empty when unavailable.\"\"\"\n    value = os.getenv(RUNTIME_DIR_ENV, \"\").strip()\n    if not value:\n        return {}\n    try:\n        index = json.loads((Path(value) / INDEX_NAME).read_text(encoding=\"utf-8\"))\n    except (OSError, json.JSONDecodeError):\n        return {}\n    return {str(key): record for key, record in index.items() if isinstance(record, dict) and record.get(\"path\")}\n\n\nclass SceneInputComponent(Component):\n    display_name = \"Scene Input\"\n    description = \"Select one raster scene from the workspace data library.\"\n    icon = \"Image\"\n    name = \"SceneInput\"\n\n    inputs = [\n        DropdownInput(\n            name=\"scene_id\",\n            display_name=\"Scene\",\n            info=f\"Scenes listed in ${RUNTIME_DIR_ENV}/{INDEX_NAME}. Use refresh after a new upload.\",\n            options=list(read_scene_index()),\n            value=\"\",\n            refresh_button=True,\n            real_time_refresh=True,\n        ),\n    ]\n\n    outputs = [\n        Output(display_name=\"Raster Path\", name=\"path\", method=\"path_message\", group_outputs=True),\n        Output(display_name=\"Scene Metadata\", name=\"metadata\", method=\"metadata_data\", group_outputs=True),\n    ]\n\n    def update_build_config(self, build_config: dict, field_value: Any, field_name: str | None = None) -> dict:  # noqa: ARG002\n        if field_name == \"scene_id\":\n            build_config[\"scene_id\"][\"options\"] = list(read_scene_index())\n        return build_config\n\n    def _record(self) -> dict[str, Any]:\n        record = read_scene_index().get(self.scene_id)\n        if record is None:\n            msg = f\"Scene '{self.scene_id}' is not in the workspace scene library\"\n            raise ValueError(msg)\n        if not Path(record[\"path\"]).is_file():\n            msg = f\"Raster for scene '{self.scene_id}' is missing: {record['path']}\"\n            raise ValueError(msg)\n        return record\n\n    def path_message(self) -> Message:\n        return Message(text=str(self._record()[\"path\"]))\n\n    def metadata_data(self) -> Data:\n        data = {\"scene_id\": self.scene_id, **self._record()}\n        self.status = data\n        return Data(data=data)\n"
+            },
+            "scene_id": {
+              "_input_type": "DropdownInput",
+              "advanced": false,
+              "combobox": false,
+              "dialog_inputs": {},
+              "display_name": "Scene",
+              "dynamic": false,
+              "external_options": {},
+              "info": "Scenes listed in $TERRAFLOW_WATER_RUNTIME_DIR/scene-index.json. Use refresh after a new upload.",
+              "name": "scene_id",
+              "options": [],
+              "options_metadata": [],
+              "override_skip": false,
+              "placeholder": "",
+              "real_time_refresh": true,
+              "refresh_button": true,
+              "required": false,
+              "show": true,
+              "title_case": false,
+              "toggle": false,
+              "tool_mode": false,
+              "trace_as_metadata": true,
+              "track_in_telemetry": true,
+              "type": "str",
+              "value": ""
+            }
+          },
+          "tool_mode": false
+        },
         "ToolResultField": {
           "base_classes": [
             "Message"
@@ -74322,7 +74435,7 @@
           "icon": "Layers",
           "legacy": false,
           "metadata": {
-            "code_hash": "298710ebf070",
+            "code_hash": "46373344b934",
             "dependencies": {
               "dependencies": [
                 {
@@ -74413,7 +74526,7 @@
               "show": true,
               "title_case": false,
               "type": "code",
-              "value": "\"\"\"Choose a paired before/after raster set for the water workflow.\n\nSets live under ``$TERRAFLOW_WATER_RUNTIME_DIR``: the synthetic fixture in\n``demo-fixtures/``, observed scenes in ``demo-fixtures/<name>/`` and web\nuploads in ``web-uploads/<id>/``. Each set needs ``before.tif`` and\n``after.tif``; ``mismatch.tif`` is optional and ``fixture.json`` describes the\ninput kind and provenance.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nfrom pathlib import Path\nfrom typing import Any\n\nfrom lfx.custom.custom_component.component import Component\nfrom lfx.io import DropdownInput, Output\nfrom lfx.schema.data import Data\nfrom lfx.schema.message import Message\n\nRUNTIME_DIR_ENV = \"TERRAFLOW_WATER_RUNTIME_DIR\"\nSYNTHETIC_SET_ID = \"demo-fixtures\"\n\n\ndef _runtime_dir() -> Path | None:\n    value = os.getenv(RUNTIME_DIR_ENV, \"\").strip()\n    return Path(value) if value else None\n\n\ndef list_input_sets() -> dict[str, Path]:\n    \"\"\"Return {set_id: directory} for every directory holding a before/after pair.\"\"\"\n    root = _runtime_dir()\n    if root is None:\n        return {}\n    fixtures = root / \"demo-fixtures\"\n    uploads = root / \"web-uploads\"\n    candidates: list[tuple[str, Path]] = [(SYNTHETIC_SET_ID, fixtures)]\n    if fixtures.is_dir():\n        candidates += [(path.name, path) for path in sorted(fixtures.iterdir()) if path.is_dir()]\n    if uploads.is_dir():\n        candidates += [\n            (f\"upload-{path.name}\", path)\n            for path in sorted(uploads.iterdir(), reverse=True)\n            if (path / \"fixture.json\").is_file()\n        ]\n    return {\n        set_id: path\n        for set_id, path in candidates\n        if (path / \"before.tif\").is_file() and (path / \"after.tif\").is_file()\n    }\n\n\ndef read_set_metadata(path: Path) -> dict[str, Any]:\n    meta_path = path / \"fixture.json\"\n    if not meta_path.is_file():\n        return {\"type\": \"synthetic_engineering_fixture\", \"input_kind\": \"water_labels\"}\n    try:\n        meta = json.loads(meta_path.read_text(encoding=\"utf-8\"))\n    except (OSError, json.JSONDecodeError):\n        return {}\n    if meta.get(\"type\") == \"sentinel1_rtc_gamma0\":\n        meta.setdefault(\"input_kind\", \"sar_backscatter\")\n    return meta if isinstance(meta, dict) else {}\n\n\nclass WaterInputSetComponent(Component):\n    display_name = \"Water Input Set\"\n    description = \"Select a paired before/after raster set (synthetic, observed or uploaded) for water analysis.\"\n    icon = \"Layers\"\n    name = \"WaterInputSet\"\n\n    inputs = [\n        DropdownInput(\n            name=\"input_set\",\n            display_name=\"Input Set\",\n            info=f\"Sets found under ${RUNTIME_DIR_ENV}. Use refresh after a new upload.\",\n            options=list(list_input_sets()),\n            value=SYNTHETIC_SET_ID,\n            refresh_button=True,\n            real_time_refresh=True,\n        ),\n    ]\n\n    outputs = [\n        Output(display_name=\"Before Path\", name=\"before_path\", method=\"before_path_message\", group_outputs=True),\n        Output(display_name=\"After Path\", name=\"after_path\", method=\"after_path_message\", group_outputs=True),\n        Output(display_name=\"Mismatch Path\", name=\"mismatch_path\", method=\"mismatch_path_message\", group_outputs=True),\n        Output(display_name=\"Set Metadata\", name=\"metadata\", method=\"metadata_data\", group_outputs=True),\n    ]\n\n    def update_build_config(self, build_config: dict, field_value: Any, field_name: str | None = None) -> dict:\n        if field_name == \"input_set\":\n            build_config[\"input_set\"][\"options\"] = list(list_input_sets())\n        return build_config\n\n    def _set_dir(self) -> Path:\n        sets = list_input_sets()\n        if self.input_set not in sets:\n            msg = f\"Input set '{self.input_set}' not found under ${RUNTIME_DIR_ENV}\"\n            raise ValueError(msg)\n        return sets[self.input_set]\n\n    def before_path_message(self) -> Message:\n        return Message(text=str(self._set_dir() / \"before.tif\"))\n\n    def after_path_message(self) -> Message:\n        return Message(text=str(self._set_dir() / \"after.tif\"))\n\n    def mismatch_path_message(self) -> Message:\n        path = self._set_dir() / \"mismatch.tif\"\n        if not path.is_file():\n            # No refusal sample in this set: skip the branch fed by this output.\n            self.stop(\"mismatch_path\")\n            return Message(text=\"\")\n        return Message(text=str(path))\n\n    def metadata_data(self) -> Data:\n        path = self._set_dir()\n        meta = read_set_metadata(path)\n        data = {\n            \"input_set\": self.input_set,\n            \"directory\": str(path),\n            \"type\": meta.get(\"type\"),\n            \"label\": meta.get(\"label\"),\n            \"input_kind\": meta.get(\"input_kind\"),\n            \"input_scale\": meta.get(\"input_scale\"),\n            \"event\": meta.get(\"event\"),\n            \"scenes\": meta.get(\"scenes\"),\n            \"claim_boundary\": meta.get(\"claim_boundary\"),\n        }\n        self.status = data\n        return Data(data=data)\n"
+              "value": "\"\"\"Choose a paired before/after raster set for the water workflow.\n\nSets live under ``$TERRAFLOW_WATER_RUNTIME_DIR``: the synthetic fixture in\n``demo-fixtures/``, observed scenes in ``demo-fixtures/<name>/`` and web\nuploads in ``web-uploads/<id>/``. Each set needs ``before.tif`` and\n``after.tif``; ``mismatch.tif`` is optional and ``fixture.json`` describes the\ninput kind and provenance.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nfrom pathlib import Path\nfrom typing import Any\n\nfrom lfx.custom.custom_component.component import Component\nfrom lfx.io import DropdownInput, Output\nfrom lfx.schema.data import Data\nfrom lfx.schema.message import Message\n\nRUNTIME_DIR_ENV = \"TERRAFLOW_WATER_RUNTIME_DIR\"\nSYNTHETIC_SET_ID = \"demo-fixtures\"\n\n\ndef _runtime_dir() -> Path | None:\n    value = os.getenv(RUNTIME_DIR_ENV, \"\").strip()\n    return Path(value) if value else None\n\n\ndef list_input_sets() -> dict[str, Path]:\n    \"\"\"Return {set_id: directory} for every directory holding a before/after pair.\"\"\"\n    root = _runtime_dir()\n    if root is None:\n        return {}\n    fixtures = root / \"demo-fixtures\"\n    uploads = root / \"web-uploads\"\n    candidates: list[tuple[str, Path]] = [(SYNTHETIC_SET_ID, fixtures)]\n    if fixtures.is_dir():\n        candidates += [(path.name, path) for path in sorted(fixtures.iterdir()) if path.is_dir()]\n    if uploads.is_dir():\n        candidates += [\n            (f\"upload-{path.name}\", path)\n            for path in sorted(uploads.iterdir(), reverse=True)\n            if (path / \"fixture.json\").is_file()\n        ]\n    return {\n        set_id: path\n        for set_id, path in candidates\n        if (path / \"before.tif\").is_file() and (path / \"after.tif\").is_file()\n    }\n\n\ndef read_set_metadata(path: Path) -> dict[str, Any]:\n    meta_path = path / \"fixture.json\"\n    if not meta_path.is_file():\n        return {\"type\": \"synthetic_engineering_fixture\", \"input_kind\": \"water_labels\"}\n    try:\n        meta = json.loads(meta_path.read_text(encoding=\"utf-8\"))\n    except (OSError, json.JSONDecodeError):\n        return {}\n    if meta.get(\"type\") == \"sentinel1_rtc_gamma0\":\n        meta.setdefault(\"input_kind\", \"sar_backscatter\")\n    return meta if isinstance(meta, dict) else {}\n\n\nclass WaterInputSetComponent(Component):\n    display_name = \"Water Input Set\"\n    description = \"Select a paired before/after raster set (synthetic, observed or uploaded) for water analysis.\"\n    icon = \"Layers\"\n    name = \"WaterInputSet\"\n\n    inputs = [\n        DropdownInput(\n            name=\"input_set\",\n            display_name=\"Input Set\",\n            info=f\"Sets found under ${RUNTIME_DIR_ENV}. Use refresh after a new upload.\",\n            options=list(list_input_sets()),\n            value=SYNTHETIC_SET_ID,\n            refresh_button=True,\n            real_time_refresh=True,\n        ),\n    ]\n\n    outputs = [\n        Output(display_name=\"Before Path\", name=\"before_path\", method=\"before_path_message\", group_outputs=True),\n        Output(display_name=\"After Path\", name=\"after_path\", method=\"after_path_message\", group_outputs=True),\n        Output(display_name=\"Mismatch Path\", name=\"mismatch_path\", method=\"mismatch_path_message\", group_outputs=True),\n        Output(display_name=\"Set Metadata\", name=\"metadata\", method=\"metadata_data\", group_outputs=True),\n    ]\n\n    def update_build_config(self, build_config: dict, field_value: Any, field_name: str | None = None) -> dict:  # noqa: ARG002\n        if field_name == \"input_set\":\n            build_config[\"input_set\"][\"options\"] = list(list_input_sets())\n        return build_config\n\n    def _set_dir(self) -> Path:\n        sets = list_input_sets()\n        if self.input_set not in sets:\n            msg = f\"Input set '{self.input_set}' not found under ${RUNTIME_DIR_ENV}\"\n            raise ValueError(msg)\n        return sets[self.input_set]\n\n    def before_path_message(self) -> Message:\n        return Message(text=str(self._set_dir() / \"before.tif\"))\n\n    def after_path_message(self) -> Message:\n        return Message(text=str(self._set_dir() / \"after.tif\"))\n\n    def mismatch_path_message(self) -> Message:\n        path = self._set_dir() / \"mismatch.tif\"\n        if not path.is_file():\n            # No refusal sample in this set: skip the branch fed by this output.\n            self.stop(\"mismatch_path\")\n            return Message(text=\"\")\n        return Message(text=str(path))\n\n    def metadata_data(self) -> Data:\n        path = self._set_dir()\n        meta = read_set_metadata(path)\n        data = {\n            \"input_set\": self.input_set,\n            \"directory\": str(path),\n            \"type\": meta.get(\"type\"),\n            \"label\": meta.get(\"label\"),\n            \"input_kind\": meta.get(\"input_kind\"),\n            \"input_scale\": meta.get(\"input_scale\"),\n            \"event\": meta.get(\"event\"),\n            \"scenes\": meta.get(\"scenes\"),\n            \"claim_boundary\": meta.get(\"claim_boundary\"),\n        }\n        self.status = data\n        return Data(data=data)\n"
             },
             "input_set": {
               "_input_type": "DropdownInput",
@@ -119177,9 +119290,9 @@
     ]
   ],
   "metadata": {
-    "num_components": 359,
+    "num_components": 360,
     "num_modules": 96
   },
-  "sha256": "b0a9c50f155ed84ca4b53b24edd165109d5a8af1de98aa8ef21fdda6979e36ea",
+  "sha256": "a2b19fde4e45011610d62ca440d2468ae8a31292584d243ed58267f415ccc78f",
   "version": "1.10.0"
 }

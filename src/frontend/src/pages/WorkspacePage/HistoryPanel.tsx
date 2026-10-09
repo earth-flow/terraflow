@@ -87,9 +87,13 @@ export default function HistoryPanel({
                 <p className="truncate text-sm">{historyLabel(item)}</p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   {formatTime(item.created_at)} ·{" "}
-                  {item.fixture_label || item.fixture_id || "—"} ·{" "}
-                  {item.model_used || "等待模型"} · {item.execution_count || 0}{" "}
-                  条记录
+                  {item.scenario_title ? item.scenario_title + " · " : ""}
+                  {item.input_title ||
+                    item.fixture_label ||
+                    item.fixture_id ||
+                    "—"}{" "}
+                  · {item.model_used || "等待模型"} ·{" "}
+                  {item.execution_count || 0} 条记录
                 </p>
               </div>
               <span className="rounded-full bg-muted px-2 py-1 text-xs">

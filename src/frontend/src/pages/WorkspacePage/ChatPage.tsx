@@ -16,16 +16,17 @@ import {
   displayTool,
   postJson,
   readEvents,
-  useDatasets,
+  useScenes,
 } from "./api";
-import DatasetCard from "./DatasetCard";
-import { visibleDatasets } from "./DatasetPicker";
 import ResultView from "./ResultView";
+import ScenePicker from "./ScenePicker";
 import type {
   ChatMessage,
   Conversation,
   GenericResult,
+  PlanInput,
   Scenario,
+  Scene,
   StepEvent,
 } from "./types";
 
@@ -43,6 +44,12 @@ const MATCHED_BY: Record<string, string> = {
   previous_run: "上一次运行用的数据",
   keyword: "任务中要求的测试数据",
 };
+const TARGET_LABELS: Record<string, string> = {
+  before: "前期",
+  after: "后期",
+  scene: "本景",
+};
+const MAX_ATTACHMENTS = 4;
 
 function Markdown({ text }: { text: string }) {
   return (
@@ -86,7 +93,7 @@ function StepList({ steps }: { steps: StepEvent[] }) {
           <span className="font-mono">
             {displayTool(step.tool)}
             {step.target
-              ? "（" + (step.target === "after" ? "后期" : "前期") + "）"
+              ? "（" + (TARGET_LABELS[step.target] ?? step.target) + "）"
               : ""}
           </span>
           <span className="text-muted-foreground">
@@ -113,22 +120,92 @@ function StepList({ steps }: { steps: StepEvent[] }) {
   );
 }
 
+function PlanInputRow({
+  input,
+  value,
+  options,
+  editable,
+  onChange,
+}: {
+  input: PlanInput;
+  value: string;
+  options: Scene[];
+  editable: boolean;
+  onChange: (sceneId: string) => void;
+}) {
+  const chosen = options.find((scene) => scene.id === value);
+  const preview = chosen?.preview ?? input.preview;
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-border bg-background p-2">
+      <div className="ws-thumb h-14 w-14 shrink-0 overflow-hidden rounded-md">
+        {preview && (
+          <img
+            src={preview}
+            alt={input.label}
+            className="h-full w-full object-cover [image-rendering:pixelated]"
+          />
+        )}
+      </div>
+      <div className="min-w-0 flex-1 text-xs">
+        <p className="font-medium">{input.label}</p>
+        {editable && options.length > 1 ? (
+          <select
+            aria-label={"更换" + input.label}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            className="mt-1 w-full rounded-lg border border-input bg-background px-2 py-1"
+          >
+            {options.map((scene) => (
+              <option key={scene.id} value={scene.id}>
+                {scene.collection_title} · {scene.acquired ?? scene.title}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <p className="mt-0.5 truncate text-muted-foreground">
+            {(chosen?.collection_title ?? input.collection_title) +
+              " · " +
+              (chosen?.acquired ?? input.acquired ?? input.scene_title)}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function PlanCard({
   message,
   live,
   busy,
+  scenes,
   onExecute,
   onCancel,
 }: {
   message: ChatMessage;
   live?: Live;
   busy: boolean;
-  onExecute: (selfCheck: boolean) => void;
+  scenes: Scene[];
+  onExecute: (selfCheck: boolean, inputs?: Record<string, string>) => void;
   onCancel: () => void;
 }) {
   const [selfCheck, setSelfCheck] = useState(false);
   const plan = message.plan!;
   const status = live ? "running" : message.status;
+  const [roles, setRoles] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      (plan.inputs ?? []).map((input) => [input.role, input.scene_id]),
+    ),
+  );
+  // Swapping is limited to scenes of the same data kind: the tool order depends on it.
+  const options = scenes.filter(
+    (scene) =>
+      !scene.self_check_for &&
+      scene.input_kind === plan.input_kind &&
+      (scene.input_scale ?? "linear") === (plan.input_scale ?? "linear") &&
+      (scene.audience === "user" || Object.values(roles).includes(scene.id)),
+  );
+  const chosen = Object.values(roles);
+  const duplicate = new Set(chosen).size < chosen.length;
   return (
     <div className="ws-plan rounded-2xl border p-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -147,12 +224,48 @@ function PlanCard({
           }
         </span>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
-        数据：{plan.input_title}
-        {plan.matched_by
-          ? "（来自" + (MATCHED_BY[plan.matched_by] ?? plan.matched_by) + "）"
-          : ""}
-      </p>
+      {plan.inputs ? (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          {plan.inputs.map((input) => (
+            <PlanInputRow
+              key={input.role}
+              input={input}
+              value={roles[input.role]}
+              options={options}
+              editable={status === "pending"}
+              onChange={(sceneId) =>
+                setRoles((current) => ({ ...current, [input.role]: sceneId }))
+              }
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 text-xs text-muted-foreground">
+          数据：{plan.input_title}（旧版计划，请重新提问以生成可执行的计划）
+        </p>
+      )}
+      {(plan.matched_by || plan.inputs_changed_by_user) && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {[
+            plan.matched_by
+              ? "数据来自" + (MATCHED_BY[plan.matched_by] ?? plan.matched_by)
+              : null,
+            plan.inputs_changed_by_user ? "执行前由你更换过" : null,
+          ]
+            .filter(Boolean)
+            .join("，")}
+        </p>
+      )}
+      {plan.notes?.map((note) => (
+        <p key={note} className="ws-warning mt-2 rounded-lg px-2 py-1 text-xs">
+          {note}
+        </p>
+      ))}
+      {duplicate && (
+        <p className="mt-2 text-xs text-destructive">
+          同一景不能同时作为两个输入。
+        </p>
+      )}
       <div className="mt-2 flex flex-wrap items-center gap-1 text-xs">
         {plan.execution_order.map((slug, index) => (
           <span key={slug} className="flex items-center gap-1">
@@ -168,8 +281,8 @@ function PlanCard({
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <Button
             type="button"
-            disabled={busy}
-            onClick={() => onExecute(selfCheck)}
+            disabled={busy || duplicate || !plan.inputs}
+            onClick={() => onExecute(selfCheck, roles)}
           >
             执行
           </Button>
@@ -181,10 +294,10 @@ function PlanCard({
           >
             取消
           </Button>
-          {plan.has_self_check_sample && (
+          {plan.self_check_available && (
             <label
               className="flex items-center gap-2 text-xs text-muted-foreground"
-              title="用这组数据附带的、故意做成尺寸不一致的样本再做一次网格检查，确认门控会拦截"
+              title="用一份故意与后期影像尺寸不一致的样本再做一次网格检查，确认门控会拦截"
             >
               <input
                 type="checkbox"
@@ -226,13 +339,19 @@ function MessageView({
   message,
   live,
   busy,
+  scenes,
   onExecute,
   onCancel,
 }: {
   message: ChatMessage;
   live?: Live;
   busy: boolean;
-  onExecute: (id: string, selfCheck: boolean) => void;
+  scenes: Scene[];
+  onExecute: (
+    id: string,
+    selfCheck: boolean,
+    inputs?: Record<string, string>,
+  ) => void;
   onCancel: (id: string) => void;
 }) {
   if (message.role === "user") {
@@ -242,7 +361,7 @@ function MessageView({
           <p className="whitespace-pre-wrap">{message.content}</p>
           {message.attachments?.length ? (
             <p className="mt-1 text-xs opacity-80">
-              附加数据：{message.attachments.length} 组
+              附加数据：{message.attachments.length} 景
             </p>
           ) : null}
         </div>
@@ -255,7 +374,10 @@ function MessageView({
         message={message}
         live={live}
         busy={busy}
-        onExecute={(selfCheck) => onExecute(message.id, selfCheck)}
+        scenes={scenes}
+        onExecute={(selfCheck, inputs) =>
+          onExecute(message.id, selfCheck, inputs)
+        }
         onCancel={() => onCancel(message.id)}
       />
     );
@@ -289,18 +411,19 @@ export default function ChatPage() {
   const { conversationId } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { datasets } = useDatasets();
+  const { scenes, collections } = useScenes();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [input, setInput] = useState("");
-  // "用这组数据对话" on the data page opens the chat with ?attach=<dataset id>.
-  const [attachments, setAttachments] = useState<string[]>(() => {
-    const attach = searchParams.get("attach");
-    return attach ? [attach] : [];
-  });
+  // The data page opens the chat with ?attach=<scene id>,<scene id>.
+  const [attachments, setAttachments] = useState<string[]>(() =>
+    (searchParams.get("attach") ?? "")
+      .split(",")
+      .filter(Boolean)
+      .slice(0, MAX_ATTACHMENTS),
+  );
   const [picker, setPicker] = useState(false);
-  const [showDeveloper, setShowDeveloper] = useState(false);
   const [draft, setDraft] = useState<Live | null>(null);
   const [live, setLive] = useState<Live | null>(null);
   const [error, setError] = useState("");
@@ -399,7 +522,11 @@ export default function ChatPage() {
     }
   }
 
-  async function execute(planId: string, selfCheck: boolean) {
+  async function execute(
+    planId: string,
+    selfCheck: boolean,
+    inputs?: Record<string, string>,
+  ) {
     if (!conversationId || busy) return;
     setError("");
     setLive({ planId, status: "正在提交…", text: "", steps: [] });
@@ -411,7 +538,7 @@ export default function ChatPage() {
           "/plans/" +
           planId +
           "/execute",
-        { self_check: selfCheck },
+        { self_check: selfCheck, inputs },
       );
       await readEvents(response, (event, data) => {
         setLive((current) => {
@@ -483,7 +610,7 @@ export default function ChatPage() {
     }
   }
 
-  const attached = datasets.filter((item) => attachments.includes(item.id));
+  const attached = scenes.filter((item) => attachments.includes(item.id));
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0">
@@ -575,7 +702,10 @@ export default function ChatPage() {
                 message={message}
                 live={live && live.planId === message.id ? live : undefined}
                 busy={busy}
-                onExecute={(id, selfCheck) => void execute(id, selfCheck)}
+                scenes={scenes}
+                onExecute={(id, selfCheck, inputs) =>
+                  void execute(id, selfCheck, inputs)
+                }
                 onCancel={(id) => void cancel(id)}
               />
             ))}
@@ -592,31 +722,24 @@ export default function ChatPage() {
         <div className="border-t border-border px-4 py-3 md:px-8">
           <div className="mx-auto w-full max-w-4xl">
             {picker && (
-              <div className="mb-3 max-h-80 overflow-y-auto rounded-2xl border border-border bg-card p-3">
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {visibleDatasets(datasets, showDeveloper).map((item) => (
-                    <DatasetCard
-                      key={item.id}
-                      fixture={item}
-                      selected={attachments.includes(item.id)}
-                      onSelect={() =>
-                        setAttachments((current) =>
-                          current.includes(item.id)
-                            ? current.filter((id) => id !== item.id)
-                            : [item.id],
-                        )
-                      }
-                    />
-                  ))}
-                </div>
-                <label className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={showDeveloper}
-                    onChange={(event) => setShowDeveloper(event.target.checked)}
-                  />
-                  显示开发者数据（合成测试栅格、测试上传）
-                </label>
+              <div className="mb-3 max-h-96 overflow-y-auto rounded-2xl border border-border bg-card p-3">
+                <p className="mb-3 text-xs text-muted-foreground">
+                  选择要分析的影像（最多 {MAX_ATTACHMENTS}{" "}
+                  景）。比较变化选两景，提取水体选一景；用途由 Agent
+                  在计划里指定，执行前可以更换。
+                </p>
+                <ScenePicker
+                  scenes={scenes}
+                  collections={collections}
+                  selected={attachments}
+                  onToggle={(scene) =>
+                    setAttachments((current) =>
+                      current.includes(scene.id)
+                        ? current.filter((id) => id !== scene.id)
+                        : current.concat(scene.id).slice(-MAX_ATTACHMENTS),
+                    )
+                  }
+                />
               </div>
             )}
             {attached.length > 0 && (
@@ -626,7 +749,7 @@ export default function ChatPage() {
                     key={item.id}
                     className="ws-chip flex items-center gap-1 rounded-full px-2 py-1 text-xs"
                   >
-                    {item.title}
+                    {item.collection_title} · {item.acquired ?? item.title}
                     <button
                       type="button"
                       aria-label="移除数据"

@@ -48,6 +48,7 @@ def gate_outcome(summary: dict[str, Any]) -> dict[str, Any]:
         "blocked_tool": chain.get("blocked_tool"),
         "reason_code": chain.get("reason_code") if blocked else preflight.get("reason_code"),
         "failed_checks": chain.get("failed_checks") if blocked else preflight.get("failed_checks") or [],
+        "label": "网格检查",
         "description": "前后两期影像的网格、坐标系、范围、分辨率、nodata 和有效区一致后才做成对分析",
     }
 
@@ -60,6 +61,115 @@ def self_check_outcome(summary: dict[str, Any]) -> dict[str, Any] | None:
         "description": "用故意做成尺寸不一致的样本再做一次网格检查，确认门控会拦截",
         "reason_code": chain.get("reason_code"),
         "failed_checks": chain.get("failed_checks") or [],
+    }
+
+
+def _area_boundary(evidence: dict[str, Any], what: str) -> str:
+    text = f"只统计{what}有效的像素；面积按 " + str(evidence.get("crs") or "投影坐标系") + " 的像元面积计算"
+    if evidence.get("pixel_area_m2"):
+        text += f"（每像元 {evidence.get('pixel_area_m2')} m²）"
+    return text + "。"
+
+
+def _gate_from_measure(summary: dict[str, Any], slug: str, label: str, description: str) -> dict[str, Any]:
+    """Gate outcome when the measuring tool itself checks labels and the area grid."""
+    step = _find(summary, slug)
+    outputs = _outputs(step)
+    chain = summary.get("success_chain") or {}
+    blocked = chain.get("status") == "blocked_by_gate"
+    return {
+        "checked": step is not None or blocked,
+        "passed": not blocked and step is not None and outputs.get("execution_blocked") is False,
+        "blocked_tool": chain.get("blocked_tool"),
+        "reason_code": chain.get("reason_code") if blocked else outputs.get("reason_code"),
+        "failed_checks": chain.get("failed_checks") if blocked else outputs.get("failed_checks") or [],
+        "label": label,
+        "description": description,
+    }
+
+
+REASON_TEXT = {
+    "unsupported_area_crs": "坐标系不是投影坐标，不能按像元算面积",
+    "area_distorting_projection": "投影会随纬度放大面积（如 Web Mercator），不能按像元算面积",
+    "unsupported_area_units": "坐标单位不是长度单位",
+    "invalid_water_labels": "标签中有 0/1 以外的值",
+    "no_valid_pixels": "没有有效像素",
+    "unsupported_band_count": "不是单波段栅格",
+}
+
+
+def water_extent_result(summary: dict[str, Any], preview_url: Callable[[str], str]) -> dict[str, Any]:
+    fixtures = summary.get("fixtures") or {}
+    sar = fixtures.get("input_kind") == "sar_backscatter"
+    gate = _gate_from_measure(
+        summary,
+        "geo_water.water_extent",
+        "面积检查",
+        "单景水体面积只在投影坐标、长度单位、不随纬度放大面积的网格上计算，标签必须是 0/1",
+    )
+    extent = _outputs(_find(summary, "geo_water.water_extent"))
+    derived = (summary.get("success_chain") or {}).get("derived_labels") or {}
+    metrics: list[dict[str, Any]] = []
+    if extent.get("extent_answerable"):
+        metrics += [
+            {"key": "valid_area_m2", "label": "有效面积", "value": _km2(extent.get("valid_area_m2")), "unit": "km²"},
+            {"key": "water_area_m2", "label": "水体面积", "value": _km2(extent.get("water_area_m2")), "unit": "km²"},
+            {
+                "key": "water_fraction",
+                "label": "水体占比",
+                "value": round(100 * float(extent.get("water_fraction") or 0), 1),
+                "unit": "%",
+                "note": "水体像元 / 有效像元",
+            },
+        ]
+    if isinstance(derived.get("threshold"), (int, float)):
+        metrics.append(
+            {
+                "key": "threshold",
+                "label": "水体阈值",
+                "value": round(float(derived["threshold"]), 2),
+                "unit": derived.get("units") or "",
+                "note": "本景 Otsu",
+            }
+        )
+    layers = [
+        {
+            "key": "scene",
+            "label": "影像" if sar else "水体标签",
+            "url": preview_url("scene"),
+            "legend": SAR_LEGEND if sar else WATER_LEGEND,
+        }
+    ]
+    if sar and derived:
+        layers.append(
+            {"key": "scene_mask", "label": "水体（阈值估计）", "url": preview_url("scene_mask"), "legend": WATER_LEGEND}
+        )
+    by_key = {item["key"]: item["value"] for item in metrics}
+    if not gate["passed"]:
+        reason = gate["reason_code"] or "未知原因"
+        headline = f"没有计算水体面积：{REASON_TEXT.get(reason, reason)}（{reason}）。"
+    elif by_key.get("water_area_m2") is not None:
+        headline = (
+            f"水体面积 {by_key['water_area_m2']} km²，占有效面积 {by_key['valid_area_m2']} km² 的 "
+            f"{by_key['water_fraction']}%。"
+        )
+    else:
+        headline = "分析完成，但没有得到水体统计。"
+    boundaries = [_area_boundary(extent, "本景")]
+    if sar:
+        boundaries.append("SAR 水体由后向散射阈值估计，不是参考标注；平滑地表、阴影也可能低于阈值。")
+    boundaries.append("单景只反映成像时刻的水面，不能说明变化或淹没。")
+    if fixtures.get("type") == "synthetic_engineering_fixture":
+        boundaries.append("这是合成测试栅格，结果只用于检查工具链。")
+    return {
+        "scenario": "water_extent",
+        "status": "success" if gate["passed"] else "blocked",
+        "headline": headline,
+        "metrics": metrics,
+        "layers": layers,
+        "gate": gate,
+        "self_check": None,
+        "boundaries": boundaries,
     }
 
 
@@ -114,7 +224,10 @@ def water_change_result(summary: dict[str, Any], preview_url: Callable[[str], st
     if not gate["passed"]:
         layers = layers[:2]  # masks are not produced when the gate blocks the pair
     by_key = {item["key"]: item["value"] for item in metrics}
-    if not gate["passed"]:
+    if not gate["passed"] and gate.get("blocked_tool") == "geo_water.water_evidence":
+        reason = gate["reason_code"] or "未知原因"
+        headline = f"没有计算水体变化：{REASON_TEXT.get(reason, reason)}（{reason}）。"
+    elif not gate["passed"]:
         headline = f"两期影像没有通过网格检查（{gate['reason_code'] or '未知原因'}），没有计算水体变化。"
     elif by_key.get("after_water_area_m2") is not None:
         headline = (
@@ -123,13 +236,7 @@ def water_change_result(summary: dict[str, Any], preview_url: Callable[[str], st
         )
     else:
         headline = "分析完成，但没有得到可比较的水体统计。"
-    boundaries = [
-        "只统计两期都有效的像素；面积按 "
-        + str(evidence.get("crs") or "投影坐标系")
-        + " 的像元面积计算"
-        + (f"（每像元 {evidence.get('pixel_area_m2')} m²）" if evidence.get("pixel_area_m2") else "")
-        + "。",
-    ]
+    boundaries = [_area_boundary(evidence, "两期都")]
     if sar:
         boundaries.append("SAR 水体由后向散射阈值估计，不是参考标注；平滑地表、阴影也可能低于阈值。")
     boundaries.append("前后水体差异本身不能证明洪水成因。")
@@ -180,6 +287,33 @@ TASK_SCENARIOS: dict[str, dict[str, Any]] = {
             "比较这两期影像的水体变化，并给出证据。",
         ],
         "build_result": water_change_result,
+    },
+    "water_extent": {
+        "id": "water_extent",
+        "title": "单景水体提取",
+        "summary": "提取一景影像中的水体范围，给出有效面积、水体面积和水体占比。",
+        "inputs": [{"role": "scene", "label": "影像"}],
+        "input_kinds": ["sar_backscatter", "water_labels"],
+        "requirements": [
+            "投影坐标系、长度单位，且不是 Web Mercator 这类随纬度放大面积的投影",
+            "SAR 后向散射（线性或 dB），或 0/1 水体标签",
+        ],
+        "outputs": ["水体图层", "有效面积、水体面积、水体占比", "面积检查结论与每步证据"],
+        "tools": [
+            "raster_viewer.inspect_geotiff",
+            "geo_raster.raster_stats",
+            "geo_raster.threshold_segmentation",
+            "geo_water.water_extent",
+        ],
+        "limitations": [
+            "SAR 水体为阈值估计，没有参考数据时不代表精度",
+            "单景不能说明变化或淹没",
+        ],
+        "examples": [
+            "色萨利 9 月 13 日那景影像里有多少水面？",
+            "提取这景影像的水体范围。",
+        ],
+        "build_result": water_extent_result,
     },
 }
 
