@@ -627,7 +627,7 @@ def unsupported_numbers(text: str, allowed_source: str) -> list[str]:
             if b:
                 derived += [a / b, 100 * a / b]
             for value in derived:
-                for digits in (0, 1, 2):
+                for digits in (0, 1, 2, 3):
                     allowed.add(f"{round(value, digits):.{digits}f}")
                 allowed.add(str(int(round(value))))
     found = []
