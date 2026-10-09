@@ -146,7 +146,11 @@ const router = createBrowserRouter(
                     />
                   </Route>
                 </Route>
-                <Route path="water-agent" element={<WaterAgentPage />} />
+                <Route path="workspace" element={<WaterAgentPage />} />
+                <Route
+                  path="water-agent"
+                  element={<CustomNavigate replace to="/workspace" />}
+                />
                 <Route path="settings" element={<SettingsPage />}>
                   <Route
                     index

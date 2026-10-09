@@ -437,9 +437,9 @@ export default function WaterAgentPage() {
       >
         <div className="hidden px-2 pb-3 md:block">
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-            Agent 工作区
+            地学 Agent 工作区
           </p>
-          <p className="mt-1 text-sm font-semibold">水体变化分析</p>
+          <p className="mt-1 text-sm font-semibold">场景：水体变化分析</p>
         </div>
         {SECTIONS.map((item) => (
           <button
@@ -490,7 +490,7 @@ export default function WaterAgentPage() {
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
                     <p className="mb-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-                      Terraflow / Agent workspace
+                      地学 Agent 工作区 · 水体变化分析
                     </p>
                     <h1 className="text-2xl font-semibold tracking-tight">
                       水体变化分析

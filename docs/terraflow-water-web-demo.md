@@ -32,7 +32,7 @@ curl http://127.0.0.1:7862/api/water-demo/health
 ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 ```
 
-然后访问 [http://127.0.0.1:14173/water-agent](http://127.0.0.1:14173/water-agent)。
+然后访问 [http://127.0.0.1:14173/workspace](http://127.0.0.1:14173/workspace)。
 
 ## 工作区分区
 
