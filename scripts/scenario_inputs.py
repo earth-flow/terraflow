@@ -383,6 +383,13 @@ def prepare(web: Any, scenario: str, chosen: dict[str, Any], key: str, self_chec
             processing_level=p.get("processing:level"),
             claim_boundary="光学水体为 NDWI 阈值估计，不是参考标注。",
         )
+    pair = ("before.tif", "after.tif") if (directory / "before.tif").exists() else ("green.tif", "nir.tif")
+    if (directory / pair[0]).exists() and (directory / pair[1]).exists():
+        # Pixel-wise pairs are compared on the support valid in both; recorded, and only on identical grids.
+        record = _align(web, "common-valid", str(directory / pair[0]), str(directory / pair[1]))
+        if record.get("applied"):
+            label = "两期共同有效区" if pair[0] == "before.tif" else "两波段共同有效区"
+            meta.setdefault("alignment", []).append({**record, "label": label})
     if scenario == "landcover_impact":
         item = chosen["landcover"]["item"]
         data = item["assets"]["data"]
@@ -406,7 +413,7 @@ def prepare(web: Any, scenario: str, chosen: dict[str, Any], key: str, self_chec
         )
         if _day(scene_date) and _day(reference_date):
             meta["date_gap_days"] = abs((_day(scene_date) - _day(reference_date)).days)
-    if scenario == "water_extent" or scenario == "water_change":
-        meta.pop("alignment")
+    if not meta.get("alignment"):
+        meta.pop("alignment", None)
     (directory / "fixture.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return directory, ready

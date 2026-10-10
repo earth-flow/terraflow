@@ -132,5 +132,12 @@ class Check(unittest.TestCase):
         self.assertIn("需要", problem)
 
 
+class ThresholdCaution(unittest.TestCase):
+    def test_flags_thresholds_outside_open_water_range(self):
+        self.assertIsNone(ws.threshold_caution({"threshold": -14.22, "units": "dB"}))
+        self.assertIn("-9.38", ws.threshold_caution({"threshold": -9.38, "units": "dB"}))
+        self.assertIsNone(ws.threshold_caution({"threshold": 0.0, "units": "NDWI"}))
+
+
 if __name__ == "__main__":
     unittest.main()

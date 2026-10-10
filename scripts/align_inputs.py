@@ -14,8 +14,12 @@ was done, which the workspace stores in the run's fixture.json as lineage:
   rasterize VECTOR TEMPLATE TARGET
             0/1 uint8 on the template grid: 1 where a pixel centre falls inside
             a polygon (rasterio all_touched=False), 0 elsewhere
+  common-valid FIRST SECOND
+            two rasters on the same grid: pixels invalid in either become
+            nodata in both (rewritten in place; a symbolic link is replaced by
+            a copy so catalog data is never modified)
 
-Nothing is modified in place.
+Only ``common-valid`` rewrites its inputs, which are run-input copies.
 """
 
 from __future__ import annotations
@@ -132,6 +136,40 @@ def rasterize_vector(args) -> dict:
     }
 
 
+def common_valid(args) -> dict:
+    """Restrict two rasters on the same grid to the pixels valid in both (nodata elsewhere)."""
+    with rasterio.open(args.first) as a, rasterio.open(args.second) as b:
+        same = (a.crs, a.transform, a.shape) == (b.crs, b.transform, b.shape)
+        if not same:
+            return {"operation": "common_valid", "applied": False, "reason": "grids differ; left to the preflight gate"}
+        data_a, data_b = a.read(1, masked=True), b.read(1, masked=True)
+        valid_a = ~np.ma.getmaskarray(data_a) & np.isfinite(data_a.filled(0).astype("float64"))
+        valid_b = ~np.ma.getmaskarray(data_b) & np.isfinite(data_b.filled(0).astype("float64"))
+        profiles = (a.profile.copy(), b.profile.copy())
+        raw = (a.read(1), b.read(1))
+    common = valid_a & valid_b
+    excluded = {"first": int(np.count_nonzero(valid_a & ~common)), "second": int(np.count_nonzero(valid_b & ~common))}
+    if not any(excluded.values()):
+        return {"operation": "common_valid", "applied": False, "reason": "valid areas already identical"}
+    for path, profile, values in ((args.first, profiles[0], raw[0]), (args.second, profiles[1], raw[1])):
+        nodata = profile.get("nodata")
+        if nodata is None:
+            nodata = float("nan") if np.issubdtype(values.dtype, np.floating) else 0
+            profile["nodata"] = nodata
+        out = np.where(common, values, nodata).astype(values.dtype)
+        target = Path(path)
+        if target.is_symlink():
+            target.unlink()  # a run input linked to catalog data: write a copy, never the original
+        _write(target, out, profile)
+    return {
+        "operation": "common_valid",
+        "applied": True,
+        "rule": "a pixel invalid (nodata or non-finite) in either raster is nodata in both",
+        "excluded_pixels": excluded,
+        "common_valid_pixels": int(np.count_nonzero(common)),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -151,8 +189,11 @@ def main() -> int:
     p.add_argument("vector", type=Path)
     p.add_argument("template", type=Path)
     p.add_argument("target", type=Path)
+    p = sub.add_parser("common-valid")
+    p.add_argument("first", type=Path)
+    p.add_argument("second", type=Path)
     args = parser.parse_args()
-    handler = {"band": band, "warp": warp, "rasterize": rasterize_vector}[args.command]
+    handler = {"band": band, "warp": warp, "rasterize": rasterize_vector, "common-valid": common_valid}[args.command]
     print(json.dumps(handler(args), ensure_ascii=False))
     return 0
 

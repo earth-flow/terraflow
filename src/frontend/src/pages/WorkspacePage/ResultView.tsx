@@ -239,13 +239,15 @@ export default function ResultView({
         </ul>
       )}
       <div className="flex flex-wrap items-center gap-3 text-xs">
-        <button
-          type="button"
-          className="text-primary underline"
-          onClick={() => void openCanvas()}
-        >
-          在 Canvas 中打开
-        </button>
+        {result.canvas !== false && (
+          <button
+            type="button"
+            className="text-primary underline"
+            onClick={() => void openCanvas()}
+          >
+            在 Canvas 中打开
+          </button>
+        )}
         <button
           type="button"
           className="text-primary underline"

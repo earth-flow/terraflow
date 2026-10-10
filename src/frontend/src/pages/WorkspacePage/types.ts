@@ -106,6 +106,8 @@ export type Layer = {
 
 export type GenericResult = {
   scenario: string;
+  /** False when the scenario has no Canvas flow builder; absent on older results. */
+  canvas?: boolean;
   status: "success" | "blocked";
   headline: string;
   metrics: Metric[];

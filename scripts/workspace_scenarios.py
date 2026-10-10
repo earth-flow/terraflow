@@ -88,6 +88,30 @@ def _gate_from_measure(summary: dict[str, Any], slug: str, label: str, descripti
     }
 
 
+# Open water in Sentinel-1 VV gamma0/sigma0 usually lies well below about -15 dB; an Otsu split far
+# outside this band more likely separates other surfaces (e.g. bright urban areas vs everything else).
+SAR_WATER_THRESHOLD_RANGE_DB = (-26.0, -12.0)
+
+
+def threshold_caution(derived: dict[str, Any]) -> str | None:
+    value = derived.get("threshold")
+    if derived.get("units") != "dB" or not isinstance(value, (int, float)):
+        return None
+    low, high = SAR_WATER_THRESHOLD_RANGE_DB
+    if low <= value <= high:
+        return None
+    return (f"注意：Otsu 阈值 {value:.2f} dB 不在开阔水体常见的 {low:.0f}～{high:.0f} dB 范围内，"
+            "直方图可能分开的是城区等高亮地物与其余地表，而不是水与陆地；这次的水体面积可信度低。")
+
+
+def _with_caution(result: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:
+    caution = threshold_caution(derived)
+    if caution and result.get("status") == "success":
+        result["headline"] = result["headline"].rstrip("。") + "（阈值偏离常见范围，见适用边界）。"
+        result["boundaries"] = [caution] + result["boundaries"]
+    return result
+
+
 REASON_TEXT = {
     "unsupported_area_crs": "坐标系不是投影坐标，不能按像元算面积",
     "area_distorting_projection": "投影会随纬度放大面积（如 Web Mercator），不能按像元算面积",
@@ -237,6 +261,7 @@ def water_change_result(summary: dict[str, Any], preview_url: Callable[[str], st
     else:
         headline = "分析完成，但没有得到可比较的水体统计。"
     boundaries = [_area_boundary(evidence, "两期都")]
+    boundaries += _alignment_boundaries(fixtures)
     if sar:
         boundaries.append("SAR 水体由后向散射阈值估计，不是参考标注；平滑地表、阴影也可能低于阈值。")
     boundaries.append("前后水体差异本身不能证明洪水成因。")
@@ -291,6 +316,10 @@ def _alignment_boundaries(fixtures: dict[str, Any]) -> list[str]:
             )
         elif record.get("operation") == "rasterize":
             out.append(f"{record.get('label', '矢量')}按像元中心落在面内栅格化到分析网格（{record.get('features')} 个面）。")
+        elif record.get("operation") == "common_valid" and record.get("applied"):
+            excluded = record.get("excluded_pixels") or {}
+            out.append(f"{record.get('label', '共同有效区')}：任一方无效的像元在两者中都按无效处理"
+                       f"（分别去掉 {excluded.get('first', 0)}、{excluded.get('second', 0)} 个像元）。")
         elif record.get("operation") == "band" and record.get("scale") is not None:
             out.append(
                 f"{record.get('label', '波段')}按登记的换算系数转为反射率（× {record.get('scale')} {record.get('offset'):+}）。"
@@ -382,7 +411,7 @@ def landcover_impact_result(summary: dict[str, Any], preview_url: Callable[[str]
     else:
         headline = "分析完成，但新增水体为 0 或没有得到分类统计。"
     boundaries = base["boundaries"][:]
-    boundaries += _alignment_boundaries(fixtures)
+    boundaries += [line for line in _alignment_boundaries(fixtures) if line not in boundaries]
     if by_class.get("valid_area_m2") and base["metrics"]:
         boundaries.append(f"按类别统计的有效面积 {_km2(by_class['valid_area_m2'])} km²：土地覆盖为无数据的像元不计入，所以合计可能略小于新增水体总面积。")
     boundaries.append("土地覆盖是分类产品（模型估计），年份与洪水不同时类别可能已变化。")
@@ -436,6 +465,7 @@ def reference_compare_result(summary: dict[str, Any], preview_url: Callable[[str
     if fixtures.get("date_gap_days") is not None:
         boundaries.append(f"影像与参考范围相差 {fixtures['date_gap_days']} 天，期间水面会变化，差异不全是识别误差。")
     boundaries.append("参考范围是制图产品（如 Copernicus EMS），不是实测真值；一致性不等于精度。")
+    boundaries.append("洪水参考范围通常不含永久水体（海、湖、河道），识别结果包含它们，会计入“仅本次识别”。")
     if sar:
         boundaries.append("SAR 水体由后向散射阈值估计；城区、植被下的水体通常漏检。")
     return {"scenario": "reference_compare", "status": "success" if gate["passed"] else "blocked", "headline": headline,
@@ -572,4 +602,6 @@ def scenario_catalog() -> list[dict[str, Any]]:
 
 def build_result(summary: dict[str, Any], preview_url: Callable[[str], str]) -> dict[str, Any]:
     scenario = TASK_SCENARIOS.get(str(summary.get("scenario") or "water_change")) or TASK_SCENARIOS["water_change"]
-    return scenario["build_result"](summary, preview_url)
+    result = scenario["build_result"](summary, preview_url)
+    result["canvas"] = bool(scenario.get("canvas_template"))
+    return _with_caution(result, (summary.get("success_chain") or {}).get("derived_labels") or {})
