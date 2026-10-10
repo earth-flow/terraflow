@@ -1002,16 +1002,13 @@ export const DEFAULT_POLLING_INTERVAL = 5000;
 export const DEFAULT_TIMEOUT = 30000;
 export const DEFAULT_FILE_PICKER_TIMEOUT = 60000;
 export const DISCORD_URL = "https://discord.com/invite/EqksyE2EX9";
-// NOTE: GITHUB_URL/BUG_REPORT_URL intentionally still point at the real,
-// unrenamed GitHub repo (earth-flow/EarthMind) -- renaming the actual GitHub
-// repository is a separate, deferred decision (see SESSION_SUMMARY.md).
-export const GITHUB_URL = "https://github.com/earth-flow/EarthMind";
+export const GITHUB_URL = "https://github.com/earth-flow/terraflow";
 export const TWITTER_URL = "https://x.com/terraflow_ai";
 export const DOCS_URL = "https://docs.terraflow.org";
 export const DATASTAX_DOCS_URL =
   "https://docs.datastax.com/en/terraflow/index.html";
 export const DESKTOP_URL = "https://www.terraflow.org/desktop";
-export const BUG_REPORT_URL = "https://github.com/earth-flow/EarthMind/issues";
+export const BUG_REPORT_URL = "https://github.com/earth-flow/terraflow/issues";
 
 export const UUID_PARSING_ERROR = "uuid_parsing";
 

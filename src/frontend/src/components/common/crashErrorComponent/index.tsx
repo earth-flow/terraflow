@@ -30,7 +30,7 @@ export default function CrashErrorComponent({
                 <p>
                   {t("crash.descriptionBefore")}{" "}
                   <a
-                    href="https://github.com/earth-flow/EarthMind/issues"
+                    href="https://github.com/earth-flow/terraflow/issues"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="font-medium hover:underline"
@@ -51,7 +51,7 @@ export default function CrashErrorComponent({
                 </Button>
 
                 <a
-                  href="https://github.com/earth-flow/EarthMind/issues/new"
+                  href="https://github.com/earth-flow/terraflow/issues/new"
                   target="_blank"
                   rel="noopener noreferrer"
                 >

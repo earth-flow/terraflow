@@ -99,7 +99,7 @@ def access_token(base_url: str) -> str:
         return http_json(f"{base_url}/api/v1/auto_login")["access_token"]
     except (HTTPError, KeyError):
         pass
-    login_file = Path(os.environ.get("TERRAFLOW_LOGIN_FILE", "~/.config/earthmind/terraflow-login.json")).expanduser()
+    login_file = Path(os.environ.get("TERRAFLOW_LOGIN_FILE", "~/.config/agent-workspace/terraflow-login.json")).expanduser()
     credentials = json.loads(login_file.read_text(encoding="utf-8"))
     form = urlencode({"username": credentials["username"], "password": credentials["password"]}).encode()
     request = Request(  # noqa: S310 - fixed http(s) Terraflow URL

@@ -255,6 +255,6 @@ flow 里的节点都是真实组件：
 
 Terraflow 关闭自动登录（`TERRAFLOW_AUTO_LOGIN=false`）时，适配层对除 `/api/water-demo/health` 以外的所有请求校验 Terraflow 会话：从 `Authorization: Bearer` 或 `access_token_lf` cookie 取出令牌，调用 `/api/v1/users/whoami` 核对，结果缓存 60 秒，未登录返回 401（影像预览同样受保护）。可用 `TERRAFLOW_WATER_REQUIRE_LOGIN=0` 关闭，仅限只监听本机的开发环境。
 
-生成 Canvas flow 时，适配层把发起请求的用户令牌通过 `TERRAFLOW_ACCESS_TOKEN` 传给 `scripts/build_water_flow.py`，flow 建在该用户名下；脚本单独运行时依次尝试自动登录和 `~/.config/earthmind/terraflow-login.json`（或 `TERRAFLOW_LOGIN_FILE`）中的账号。
+生成 Canvas flow 时，适配层把发起请求的用户令牌通过 `TERRAFLOW_ACCESS_TOKEN` 传给 `scripts/build_water_flow.py`，flow 建在该用户名下；脚本单独运行时依次尝试自动登录和 `~/.config/agent-workspace/terraflow-login.json`（或 `TERRAFLOW_LOGIN_FILE`）中的账号。
 
 通过普通 http（非 localhost）访问时，需设置 `TERRAFLOW_REFRESH_SECURE=false`、`TERRAFLOW_REFRESH_SAME_SITE=lax`，否则浏览器会丢弃刷新令牌 cookie，登录一小时后失效。
