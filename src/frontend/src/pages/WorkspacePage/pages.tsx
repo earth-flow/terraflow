@@ -9,14 +9,10 @@ import ToolsPanel from "./ToolsPanel";
 import type { HistoryItem } from "./types";
 
 export function DataPage() {
-  const { scenes, collections, refresh } = useScenes();
   const navigate = useNavigate();
   return (
     <PageFrame>
       <DataPanel
-        scenes={scenes}
-        collections={collections}
-        onUploaded={refresh}
         onUse={(ids) =>
           navigate("/workspace?attach=" + ids.map(encodeURIComponent).join(","))
         }

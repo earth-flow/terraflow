@@ -142,3 +142,9 @@
   border: 1px solid hsl(var(--border));
   padding: 0.2rem 0.5rem;
 }
+.ws-text-success {
+  color: var(--success-foreground);
+}
+.ws-text-warning {
+  color: hsl(var(--warning-foreground));
+}

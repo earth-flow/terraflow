@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import type { Collection, Scene } from "./types";
+import type {
+  CatalogCollection,
+  CatalogItem,
+  Collection,
+  Scene,
+} from "./types";
 
 export const API = "/api/workspace";
 
@@ -93,6 +98,33 @@ export function useScenes() {
     void refresh();
   }, [refresh]);
   return { scenes, collections, error, refresh };
+}
+
+/** The data catalog: every dataset as a STAC Item, grouped by collection. */
+export function useCatalog() {
+  const [items, setItems] = useState<CatalogItem[]>([]);
+  const [collections, setCollections] = useState<CatalogCollection[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const refresh = useCallback(async () => {
+    try {
+      const body = await apiJson<{
+        items: CatalogItem[];
+        collections: CatalogCollection[];
+      }>(API + "/catalog");
+      setItems(body.items);
+      setCollections(body.collections);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法读取数据列表。");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  return { items, collections, error, loading, refresh };
 }
 
 /** Scenes a user picks from: no self-check samples, developer data only on request. */

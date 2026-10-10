@@ -94,6 +94,30 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 面积统计只在投影坐标、长度单位、且不随纬度放大面积的网格上进行：`geo_water.water_evidence` 与 `geo_water.water_extent` 共用同一检查，地理坐标（`unsupported_area_crs`）和 Web Mercator 等 Mercator 投影（`area_distorting_projection`）会被拦截；UTM（横轴墨卡托）不受影响。数据卡片上的“约 X km²”对这类网格同样不显示。
 
+## 数据目录（2026-10-10 起）
+
+数据页改为数据目录：每份数据是一条 STAC 1.1 条目（Item），同一组数据是一个集合（Collection），一个集合只放一种类型。设计见研究仓库 `research/2026-10-10-data-record-and-types-design.md`。
+
+| 文件 | 作用 |
+| --- | --- |
+| `scripts/data_types.py` | 五种类型的规格：可接受的文件格式、表单字段、校验规则（通过 / 注意 / 不通过及原因）、STAC 条目的写法、从文件读出的预填建议。STAC 没有的字段用 `workspace:` 前缀（类型、观测或估计、来源是否核实、受众、地点、事件、SAR 定标约定、DEM 高程类型与基准、矢量用途）。只用标准库 |
+| `scripts/data_catalog.py` | 存储、列表、按 bbox / 时间 / 类型 / 集合 / 文本查询、预览、上传三步（建立上传 → 逐个文件上传并读取 → 按条目校验并登记），以及早期数据的只读转换和场景兼容层 |
+| `scripts/inspect_geodata.py` | 在地理处理环境中读取栅格（网格、波段、抽样统计、整数栅格的不同取值）和矢量（图层、坐标系、几何类型、要素数、属性列、无效几何）；把 zip 中的 Shapefile 转为 GeoPackage |
+| `scripts/render_raster_preview.py`、`scripts/render_vector_preview.py` | 预览：SAR 按 VV 波段 dB 拉伸，光学真彩色，DEM 山体阴影叠加高程色带，分类栅格按类别颜色，矢量按经纬度绘制 |
+| `scripts/test_data_types.py` | 规则与条目格式的单元测试（合成的文件描述，不读真实文件） |
+
+| 类型 | 接受格式 | 主要检查 |
+| --- | --- | --- |
+| SAR 后向散射 | GeoTIFF，每个波段一种极化 | 极化数与波段数一致；浮点；线性值中负值过多时提醒可能是 dB；复数（SLC）拒收 |
+| 多光谱光学 | GeoTIFF，多波段或每波段一个文件，可附 SCL 云掩膜 | 每个波段填标准名且不重复；整数存储需填 scale；各文件同一坐标系、分辨率成整数倍、范围重叠；换算后的反射率范围 |
+| 高程（DEM） | 单波段 GeoTIFF | 时间用起止日期；高程范围；未填高程基准时提醒；地理坐标时说明坡度前需投影 |
+| 矢量 | GeoJSON、GeoPackage、Shapefile（zip） | 有要素、有坐标系（Shapefile 缺 .prj 拒收）、无效几何数；参考范围需填说明，类别列需存在。Shapefile 登记为转换后的 GeoPackage，原始 zip 作为附加文件保留 |
+| 分类栅格 | 单波段整数 GeoTIFF | 像元值都在类别表中（否则列出多出的值并拒收）；人工标注需填说明；预设水体 0/1 和 ESA WorldCover |
+
+存放位置：上传文件在 `runtime/data-uploads/dup_*/`（`upload.json` 记录每个文件的原名、大小、sha256、读取结果和每条的检查结果）；条目和集合在 `runtime/catalog/collections/col_*/`。条目的 `href` 是服务器上的绝对路径。早期数据（`demo-fixtures`、`web-uploads`、`scene-uploads`、`self-check`）每次列表时按旧 JSON 转换成条目，id 不变，旧文件和旧 JSON 不改动；读取结果缓存在 `runtime/catalog/legacy-profiles.json`。
+
+与场景的关系：两个水体场景仍只接受 SAR 后向散射和 0/1 水体标签。新上传的 SAR 条目只要有 VV 波段即可使用，多波段文件在运行时把 VV 波段写成单独文件（运行输入的 `fixture.json` 记录 `band_extracted`）；类别表恰为 `0 non_water / 1 water` 的分类栅格可以作为水体标签使用。光学、DEM、矢量和其他分类栅格可以上传、查看和查询，分析场景尚未接入。多波段 SAR 不写入 Canvas 的 `scene-index.json`，因为 Canvas 工具读取第一个波段。
+
 ## 页面能展示什么
 
 - 会话消息列表。每次提交时，最近 6 条消息会作为上下文传给 Qwen 规划；超出长度时先丢弃最早的消息，当前任务不会被截断。
@@ -155,6 +179,14 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/water-demo/health` | 服务状态和当前是否有任务在运行 |
+| GET | `/api/workspace/data-types` | 五种类型的规格、类别预设、可加入的数据组、上传大小上限 |
+| GET | `/api/workspace/catalog` | 数据目录：条目（含页面用的摘要字段）和集合 |
+| GET | `/api/workspace/items?bbox=w,s,e,n&datetime=a/b&data_type=sar,optical&collection=&q=&developer=1&limit=` | 按范围相交、时间区间、类型、集合、文本查询 |
+| GET | `/api/workspace/items/{id}` | 完整的 STAC 条目及所属集合 |
+| GET | `/api/workspace/items/{id}/preview` | 条目预览 PNG |
+| POST | `/api/workspace/data-uploads` | 新建上传，body `{data_type, collection_id 或 collection_title/place/event, test}` |
+| PUT | `/api/workspace/data-uploads/{id}/files` | 上传一个文件（`X-File-Name`），返回读取结果和预填建议；格式不符返回 415 |
+| POST | `/api/workspace/data-uploads/{id}/finalize` | body `{items: [{files, roles, bands, fields, classes}]}`；逐条校验，登记通过的，返回每条结果；未通过的可修改后再次提交 |
 | GET | `/api/water-demo/fixtures` | 可选输入组合，含来源、输入类型和影像时相 |
 | POST | `/api/water-demo/uploads` | 新建上传，body 为 `{label, input_kind, input_scale}` |
 | POST | `/api/water-demo/resolve-input` | body `{prompt, current}`；本机 Qwen 识别任务里提到的数据，返回 `input_set`、`mentioned`、`unmatched` |

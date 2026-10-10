@@ -57,6 +57,22 @@ print(json.dumps({"columns_removed": removed}))
 """
 
 
+_EXTRACT_BAND = """
+import sys
+import rasterio
+source, target, band = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with rasterio.open(source) as src:
+    profile = src.profile.copy()
+    profile.update(count=1)
+    data = src.read(band)
+    description = src.descriptions[band - 1]
+with rasterio.open(target, "w", **profile) as dst:
+    dst.write(data, 1)
+    if description:
+        dst.set_band_description(1, description)
+"""
+
+
 # Same rule as Terrabox geo_water: no nominal-pixel areas on Mercator-family grids.
 MERCATOR_CODES = {"EPSG:3857", "EPSG:900913", "EPSG:3785", "EPSG:3395", "EPSG:54004"}
 
@@ -213,9 +229,14 @@ class SceneLibrary:
             )
         return scenes
 
-    def scenes(self) -> list[dict[str, Any]]:
+    def legacy_scenes(self) -> list[dict[str, Any]]:
+        """Data from before the typed catalog (fixtures, paired and single-band uploads, self-checks)."""
         scenes = self._uploaded() + self._legacy()
-        scenes += self._self_checks({scene["id"]: scene for scene in scenes})
+        return scenes + self._self_checks({scene["id"]: scene for scene in scenes})
+
+    def scenes(self) -> list[dict[str, Any]]:
+        # Typed catalog uploads that a current scenario can use (SAR with VV, 0/1 water labels).
+        scenes = self.legacy_scenes() + self.web.CATALOG.scenario_scenes()
         for scene in scenes:
             scene["audience"] = "developer" if scene["category"] in DEVELOPER_CATEGORIES else "user"
             scene["area_km2"] = _area_km2(scene["grid"])
@@ -253,12 +274,14 @@ class SceneLibrary:
         return {"status": "ok", "scenes": public, "collections": list(collections.values())}
 
     def _write_index(self, scenes: list[dict[str, Any]]) -> None:
+        # Multi-band files are left out: Canvas tools read the first band, which need not be VV.
         index = {
             scene["id"]: {
                 key: scene.get(key)
                 for key in ("path", "title", "collection_title", "acquired", "sensor", "input_kind", "input_scale", "category")
             }
             for scene in scenes
+            if (scene.get("band_count") or 1) == 1
         }
         text = json.dumps(index, ensure_ascii=False, indent=1, sort_keys=True)
         with self.lock:
@@ -275,6 +298,8 @@ class SceneLibrary:
         scene = self.get(scene_id)
         if scene is None:
             return None
+        if scene.get("stac_item"):
+            return self.web.CATALOG.preview(scene_id)
         if scene["input_kind"] == "sar_backscatter":
             return self.web.render_preview(Path(scene["path"]), "sar", scene.get("input_scale", "linear"))
         return self.web.render_preview(Path(scene["path"]), "labels")
@@ -460,6 +485,16 @@ class SceneLibrary:
         (directory / "sample.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return directory / "sample.tif", {"scene_id": f"selfcheck.{key}", **meta}
 
+    def _extract_band(self, source: Path, target: Path, band: int) -> str | None:
+        try:
+            completed = subprocess.run(
+                [self.web.GEO_PYTHON, "-I", "-c", _EXTRACT_BAND, str(source), str(target), str(band)],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"无法提取波段 {band}：{exc}"
+        return None if completed.returncode == 0 else f"无法提取波段 {band}：{completed.stderr.strip()[-300:]}"
+
     def prepare_inputs(
         self, task: str, scenes: dict[str, dict[str, Any]], key: str, self_check: bool
     ) -> tuple[Path, bool]:
@@ -469,8 +504,17 @@ class SceneLibrary:
         for old in directory.glob("*.tif"):
             old.unlink()
         names = {"scene": "scene.tif"} if task == "water_extent" else {"before": "before.tif", "after": "after.tif"}
+        extracted = {}
         for role, name in names.items():
-            (directory / name).symlink_to(Path(scenes[role]["path"]).resolve())
+            scene = scenes[role]
+            if (scene.get("band_count") or 1) > 1:
+                # A multi-band upload (e.g. VV+VH): the runner reads one band, so write that band out.
+                problem = self._extract_band(Path(scene["path"]), directory / name, int(scene.get("band_index") or 1))
+                if problem:
+                    raise RuntimeError(problem)
+                extracted[role] = {"band": int(scene.get("band_index") or 1), "of": scene["band_count"]}
+            else:
+                (directory / name).symlink_to(Path(scene["path"]).resolve())
         first = next(iter(scenes.values()))
         categories = {scene["category"] for scene in scenes.values()}
         source_types = {scene.get("source_type") for scene in scenes.values()}
@@ -505,6 +549,8 @@ class SceneLibrary:
             },
             "claim_boundary": " ".join(sorted({str(s.get("claim_boundary") or "") for s in scenes.values()})).strip(),
         }
+        if extracted:
+            meta["band_extracted"] = extracted
         ready = False
         if self_check and task == "water_change":
             sample, info = self.self_check_sample(scenes["after"])

@@ -1100,6 +1100,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/water-demo/scenes":
             self._send(200, LIBRARY.catalog())
             return
+        if path == "/api/water-demo/data-types":
+            self._send(200, {"status": "ok", "types": data_types.public_specs(),
+                             "class_presets": data_types.CLASS_PRESETS,
+                             "collections": CATALOG.upload_collections(),
+                             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)})
+            return
+        if path == "/api/water-demo/catalog":
+            self._send(200, CATALOG.listing())
+            return
+        if path == "/api/water-demo/items":
+            query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            self._send(*CATALOG.search(query))
+            return
         if path == "/api/water-demo/fixtures":
             self._send(200, {"status": "ok", "fixtures": fixture_options()})
             return
@@ -1114,6 +1127,17 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "scenes"] and parts[4] == "preview":
             self._send_png(LIBRARY.preview(parts[3]))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "items"] and parts[4] == "preview":
+            self._send_png(CATALOG.preview(parts[3]))
+            return
+        if len(parts) == 4 and parts[:3] == ["api", "water-demo", "items"]:
+            found = CATALOG.get(parts[3])
+            if found is None:
+                self._send(404, {"status": "not_found", "error": "数据不存在"})
+            else:
+                item, collection = found
+                self._send(200, {"status": "ok", "item": item, "collection": collection})
             return
         if len(parts) == 6 and parts[:3] == ["api", "water-demo", "input-sets"] and parts[4] == "preview":
             self._send_png(input_preview(parts[3], parts[5]))
@@ -1176,7 +1200,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         parts = [unquote(part) for part in parsed.path.split("/") if part]
         scene_upload = len(parts) == 5 and parts[:3] == ["api", "water-demo", "scene-uploads"] and parts[4] == "files"
-        if not scene_upload and (len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]):
+        data_upload = len(parts) == 5 and parts[:3] == ["api", "water-demo", "data-uploads"] and parts[4] == "files"
+        if not (scene_upload or data_upload) and (len(parts) != 5 or parts[:3] != ["api", "water-demo", "uploads"]):
             self._send(404, {"status": "not_found", "error": "unknown endpoint"})
             return
         try:
@@ -1184,7 +1209,9 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         filename = unquote(self.headers.get("X-File-Name", "") or "")
-        if scene_upload:
+        if data_upload:
+            status, body = CATALOG.store_file(parts[3], self.rfile, length, filename)
+        elif scene_upload:
             query = parse_qs(parsed.query)
             status, body = LIBRARY.store_file(
                 parts[3],
@@ -1238,6 +1265,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             current = payload.get("current")
             self._send(*resolve_input_set(str(payload["prompt"]), str(current) if current else None))
+            return
+        if path == "/api/water-demo/data-uploads":
+            payload = self._read_json_body()
+            if payload is None:
+                self._send(400, {"status": "invalid_request", "error": "请求体必须是 JSON。"})
+                return
+            self._send(*CATALOG.create_upload(payload))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "data-uploads"] and parts[4] == "finalize":
+            payload = self._read_json_body()
+            if payload is None:
+                self._send(400, {"status": "invalid_request", "error": "请求体必须是 JSON。"})
+                return
+            self._send(*CATALOG.finalize(parts[3], payload))
             return
         if path == "/api/water-demo/scene-uploads":
             payload = self._read_json_body()
@@ -1358,11 +1399,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # Imported here because the agent and scenario modules use the functions above.
+import data_catalog  # noqa: E402
+import data_types  # noqa: E402
 import scene_library  # noqa: E402
 import workspace_agent  # noqa: E402
 import workspace_scenarios  # noqa: E402
 
 LIBRARY = scene_library.SceneLibrary(sys.modules[__name__])
+CATALOG = data_catalog.DataCatalog(sys.modules[__name__])
 AGENT = workspace_agent.WorkspaceAgent(sys.modules[__name__])
 
 

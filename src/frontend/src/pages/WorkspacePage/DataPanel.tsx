@@ -1,102 +1,127 @@
 import { useState } from "react";
-import { pickableScenes, sceneFacts } from "./api";
-import SceneCard from "./SceneCard";
-import type { Collection, Scene } from "./types";
-import { CATEGORY_LABELS } from "./types";
+import { useCatalog } from "./api";
+import ItemDetail from "./ItemDetail";
+import type { CatalogItem } from "./types";
 import UploadPanel from "./UploadPanel";
 
-function SceneDetail({ scene }: { scene: Scene }) {
-  const source = scene.source ?? {};
-  const grid = scene.grid ?? {};
+const TYPE_FILTERS = [
+  { id: "", label: "全部" },
+  { id: "sar", label: "SAR" },
+  { id: "optical", label: "光学" },
+  { id: "dem", label: "DEM" },
+  { id: "vector", label: "矢量" },
+  { id: "classification", label: "分类栅格" },
+];
+
+function ItemCard({ item }: { item: CatalogItem }) {
+  const badges = [
+    item.type_label,
+    item.origin && item.origin !== "observed"
+      ? (item.origin_label ?? "").split("（")[0]
+      : null,
+    item.verification === "declared" && !item.legacy ? "未核实来源" : null,
+    item.self_check_for ? "门控自检样本" : null,
+  ].filter(Boolean) as string[];
   return (
-    <div className="rounded-2xl border border-border bg-card p-4 text-xs leading-5 text-muted-foreground">
-      <p className="text-sm font-medium text-foreground">
-        {scene.collection_title} · {scene.title}
+    <div className="ws-dataset block w-full rounded-2xl border border-border bg-card p-2.5 text-left">
+      <div className="ws-thumb aspect-square overflow-hidden rounded-lg">
+        <img
+          src={item.preview}
+          alt={item.title}
+          loading="lazy"
+          className={
+            "h-full w-full [image-rendering:pixelated] " +
+            (item.data_type === "vector" ? "object-contain" : "object-cover")
+          }
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {badges.map((badge) => (
+          <span
+            key={badge}
+            className="rounded-full bg-muted px-2 py-0.5 text-[11px]"
+          >
+            {badge}
+          </span>
+        ))}
+      </div>
+      <p className="mt-1 break-words text-sm font-medium leading-5">
+        {item.title}
       </p>
-      <p className="mt-1">{sceneFacts(scene).join(" · ")}</p>
-      {scene.event && <p>事件：{scene.event}</p>}
-      {source.datetime && (
-        <p>
-          成像时间：{source.datetime.slice(0, 16).replace("T", " ")} UTC
-          {source.platform ? "，" + source.platform : ""}
-          {source.polarization ? "，" + source.polarization : ""}
-          {source.relative_orbit !== undefined
-            ? "，相对轨道 " +
-              source.relative_orbit +
-              (source.orbit_state ? "（" + source.orbit_state + "）" : "")
-            : ""}
-        </p>
-      )}
-      {source.item_id && (
-        <p className="break-all">
-          STAC item：
-          {source.stac_item_url ? (
-            <a
-              className="text-primary underline"
-              href={source.stac_item_url}
-              target="_blank"
-              rel="noreferrer"
-            >
-              {source.item_id}
-            </a>
-          ) : (
-            source.item_id
-          )}
-        </p>
-      )}
-      {scene.original_name && <p>上传文件：{scene.original_name}</p>}
-      {grid.crs && (
-        <p>
-          网格：{grid.crs}
-          {grid.shape ? "，" + [...grid.shape].reverse().join("×") : ""}
-          {grid.resolution ? "，" + Math.abs(grid.resolution[0]) + " m" : ""}
-        </p>
-      )}
-      {scene.self_check_for && (
-        <p>用途：门控自检，故意与原影像不在同一网格，不用于分析。</p>
-      )}
-      {scene.claim_boundary && <p>使用边界：{scene.claim_boundary}</p>}
+      <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+        {item.facts.filter((fact) => fact !== item.type_label).join(" · ")}
+      </p>
     </div>
   );
 }
 
 export default function DataPanel({
-  scenes,
-  collections,
-  onUploaded,
   onUse,
 }: {
-  scenes: Scene[];
-  collections: Collection[];
-  onUploaded: () => Promise<void>;
-  onUse: (sceneIds: string[]) => void;
+  onUse: (itemIds: string[]) => void;
 }) {
+  const { items, collections, error, loading, refresh } = useCatalog();
   const [showDeveloper, setShowDeveloper] = useState(false);
+  const [filter, setFilter] = useState("");
   const [detail, setDetail] = useState<string | null>(null);
-  // Self-check samples are listed with developer data, next to their scene.
-  const shown = scenes.filter(
-    (scene) => showDeveloper || scene.audience !== "developer",
+  const shown = items.filter(
+    (item) =>
+      (showDeveloper || item.audience !== "developer") &&
+      (!filter || item.data_type === filter),
   );
+  const counts = new Map<string, number>();
+  for (const item of items)
+    if (showDeveloper || item.audience !== "developer")
+      counts.set(item.data_type, (counts.get(item.data_type) ?? 0) + 1);
   const groups = collections
     .map((collection) => ({
       collection,
-      items: shown.filter((scene) => scene.collection_id === collection.id),
+      members: shown.filter((item) => item.collection_id === collection.id),
     }))
-    .filter((group) => group.items.length > 0);
-  const opened = scenes.find((scene) => scene.id === detail);
+    .filter((group) => group.members.length > 0);
+  const opened = items.find((item) => item.id === detail);
 
   return (
     <section className="space-y-4">
       <div className="rounded-2xl border border-border bg-card p-5">
         <h2 className="font-semibold">数据</h2>
         <p className="mt-1 text-sm leading-6 text-muted-foreground">
-          数据按“景”管理：每景是一幅单波段影像，记录成像日期、传感器和数据类型，同一事件或同一次上传的几景归为一组。
-          分析时由计划指定每景的用途，例如水体变化选两景作前期、后期，单景水体提取选一景。
+          每份数据按 STAC
+          条目记录：时间、范围、坐标网格、波段或类别、来源和处理说明。 目前支持
+          SAR
+          后向散射、多光谱光学、高程（DEM）、矢量和分类栅格五类，同一组只放一类数据。
+          现有的两个水体场景能用 SAR（含 VV 波段）和 0/1
+          水体分类栅格；其他类型可以上传和查看，分析场景随后接入。
         </p>
-        <UploadPanel onUploaded={onUploaded} />
+        <UploadPanel onUploaded={refresh} />
       </div>
-      {groups.map(({ collection, items }) => {
-        const usable = pickableScenes(items, showDeveloper);
+      <div className="flex flex-wrap gap-2">
+        {TYPE_FILTERS.map((option) => (
+          <button
+            key={option.id}
+            type="button"
+            onClick={() => setFilter(option.id)}
+            className={
+              "rounded-full border px-3 py-1 text-xs " +
+              (filter === option.id
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-border bg-card")
+            }
+          >
+            {option.label}
+            {option.id ? " " + (counts.get(option.id) ?? 0) : ""}
+          </button>
+        ))}
+      </div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      {loading && (
+        <p className="text-sm text-muted-foreground">读取数据列表…</p>
+      )}
+      {!loading && groups.length === 0 && !error && (
+        <p className="text-sm text-muted-foreground">这一类还没有数据。</p>
+      )}
+      {groups.map(({ collection, members }) => {
+        const usable = members.filter((item) => item.usable_in.length > 0);
         return (
           <div
             key={collection.id}
@@ -106,46 +131,47 @@ export default function DataPanel({
               <h3 className="font-medium">{collection.title}</h3>
               <span className="text-xs text-muted-foreground">
                 {[
+                  collection.type_label,
                   collection.place,
                   collection.period,
-                  items.length + " 景",
-                  CATEGORY_LABELS[collection.category] ?? collection.category,
+                  members.length + " 份",
+                  collection.legacy ? "早期数据（只读转换）" : null,
                 ]
                   .filter(Boolean)
                   .join(" · ")}
               </span>
-              {usable.length > 0 && (
+              {usable.length > 1 && (
                 <button
                   type="button"
                   className="ml-auto text-xs text-primary underline"
-                  onClick={() => onUse(usable.map((scene) => scene.id))}
+                  onClick={() => onUse(usable.map((item) => item.id))}
                 >
                   用这一组对话
                 </button>
               )}
             </div>
             <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-              {items.map((scene) => (
-                <div key={scene.id} className="flex flex-col gap-1.5">
-                  <SceneCard scene={scene} />
+              {members.map((item) => (
+                <div key={item.id} className="flex min-w-0 flex-col gap-1.5">
+                  <ItemCard item={item} />
                   <div className="flex flex-wrap gap-x-3 px-1">
-                    {!scene.self_check_for && (
+                    {item.usable_in.length > 0 && (
                       <button
                         type="button"
                         className="text-xs text-primary underline"
-                        onClick={() => onUse([scene.id])}
+                        onClick={() => onUse([item.id])}
                       >
-                        用这景对话
+                        用这份数据对话
                       </button>
                     )}
                     <button
                       type="button"
                       className="text-xs text-muted-foreground underline"
                       onClick={() =>
-                        setDetail(detail === scene.id ? null : scene.id)
+                        setDetail(detail === item.id ? null : item.id)
                       }
                     >
-                      {detail === scene.id ? "收起来源" : "来源"}
+                      {detail === item.id ? "收起详情" : "详情"}
                     </button>
                   </div>
                 </div>
@@ -153,7 +179,7 @@ export default function DataPanel({
             </div>
             {opened && opened.collection_id === collection.id && (
               <div className="mt-3">
-                <SceneDetail scene={opened} />
+                <ItemDetail item={opened} />
               </div>
             )}
           </div>
