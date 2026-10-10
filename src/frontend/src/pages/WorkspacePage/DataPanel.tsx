@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useCatalog } from "./api";
+import ItemCard from "./ItemCard";
 import ItemDetail from "./ItemDetail";
-import type { CatalogItem } from "./types";
 import UploadPanel from "./UploadPanel";
 
 const TYPE_FILTERS = [
@@ -12,48 +12,6 @@ const TYPE_FILTERS = [
   { id: "vector", label: "矢量" },
   { id: "classification", label: "分类栅格" },
 ];
-
-function ItemCard({ item }: { item: CatalogItem }) {
-  const badges = [
-    item.type_label,
-    item.origin && item.origin !== "observed"
-      ? (item.origin_label ?? "").split("（")[0]
-      : null,
-    item.verification === "declared" && !item.legacy ? "未核实来源" : null,
-    item.self_check_for ? "门控自检样本" : null,
-  ].filter(Boolean) as string[];
-  return (
-    <div className="ws-dataset block w-full rounded-2xl border border-border bg-card p-2.5 text-left">
-      <div className="ws-thumb aspect-square overflow-hidden rounded-lg">
-        <img
-          src={item.preview}
-          alt={item.title}
-          loading="lazy"
-          className={
-            "h-full w-full [image-rendering:pixelated] " +
-            (item.data_type === "vector" ? "object-contain" : "object-cover")
-          }
-        />
-      </div>
-      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        {badges.map((badge) => (
-          <span
-            key={badge}
-            className="rounded-full bg-muted px-2 py-0.5 text-[11px]"
-          >
-            {badge}
-          </span>
-        ))}
-      </div>
-      <p className="mt-1 break-words text-sm font-medium leading-5">
-        {item.title}
-      </p>
-      <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
-        {item.facts.filter((fact) => fact !== item.type_label).join(" · ")}
-      </p>
-    </div>
-  );
-}
 
 export default function DataPanel({
   onUse,

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.request import Request, urlopen
 
+import scenario_inputs
 import workspace_scenarios as scenarios
 
 Event = tuple[str, dict[str, Any]]
@@ -232,39 +233,46 @@ class WorkspaceAgent:
     # ---------------------------------------------------------------- one turn
 
     def decide(self, conversation: dict[str, Any], content: str, attachments: list[str]) -> dict[str, Any]:
+        """Run or answer; for a run, the scenario and a catalog query (place, dates) - never an item list."""
         developer = any(word in content.lower() for word in ("合成", "测试", "synthetic", "test"))
-        offered = self._scenes(include_developer=developer or bool(attachments))
-        by_id = {scene["id"]: scene for scene in self.web.LIBRARY.scenes()}
-        attachments = [item for item in attachments if item in by_id]
-        previous = [item for item in self._run_scene_ids(self._last_run(conversation)) if item in by_id]
-        catalog = [
-            {key: spec[key] for key in ("id", "title", "summary", "inputs", "input_kinds")}
-            for spec in scenarios.scenario_catalog()
-        ]
+        entries = scenario_inputs.usable_entries(self.web.CATALOG, include_developer=developer or bool(attachments))
+        views = {entry["view"]["id"]: entry["view"] for entry in entries}
+        attachments = [item for item in attachments if item in views]
+        previous = [item for item in self._run_scene_ids(self._last_run(conversation)) if item in views]
+        places = scenario_inputs.places(entries)
+        place_names = [p["place"] for p in places]
         request = {
             "latest_message": content,
-            "attached_scenes": attachments,
+            "attached_data": [
+                {"id": i, "place": scenario_inputs.place_of(views[i]), "date": views[i].get("date"),
+                 "type": views[i]["type_label"]} for i in attachments
+            ],
             "conversation": self._history(conversation),
-            "scenes": offered,
-            "scenarios": catalog,
-            "previous_run_scenes": previous,
+            "places": places,
+            "previous_run_place": scenario_inputs.place_of(views[previous[0]]) if previous else None,
+            "scenarios": [
+                {"id": spec["id"], "title": spec["title"], "summary": spec["summary"],
+                 "needs": [slot["label"] for slot in spec["slots"]]}
+                for spec in scenarios.scenario_catalog()
+            ],
             "instructions": [
                 "Decide whether the latest message needs a new analysis run (action=run) or can be answered "
-                "from the conversation, the scene list and previous results (action=answer).",
+                "from the conversation, the data summary and previous results (action=answer).",
                 "Choose run only when the user asks to analyse, compute, extract or compare data and a scenario "
                 "fits. Questions about earlier results, explanations, available data or capabilities are answer.",
-                "scenario: water_change compares two dates (change, new or receded water, before/after a flood); "
-                "water_extent measures water in one scene (how much water, water extent at one date).",
-                "scenes: ids of the scenes to analyse - attached scenes, scenes the message names (copy the naming "
-                "words exactly into mentioned), or previous_run_scenes when the message refers to the same data. "
-                "Two scenes of the same place for water_change, one for water_extent (use dates in the message).",
-                "If the message names a place or event that matches no scene, set unmatched true.",
+                "scenario: water_change = change between two dates; water_extent = water at one date from SAR; "
+                "optical_water = water from optical/Sentinel-2/NDWI; landcover_impact = which land cover (cropland, "
+                "built-up...) was flooded; reference_compare = compare with a reference flood extent such as EMS.",
+                "place: copy exactly one place name from places when the message, the attachments or the previous "
+                "run refer to it; null otherwise. Do not pick data; the system selects it from the place and dates.",
+                "If the message names a place or event that matches none of the places, set unmatched true and "
+                "copy the naming words into mentioned.",
             ],
             "return_schema": {
                 "action": "answer or run",
                 "scenario": "scenario id or null",
-                "scenes": ["scene id"],
-                "mentioned": "exact words from the message, or null",
+                "place": "one of the place names, or null",
+                "mentioned": "exact words from the message naming a place or event, or null",
                 "unmatched": False,
             },
         }
@@ -275,43 +283,37 @@ class WorkspaceAgent:
             scenario = "water_change" if len(attachments) == 2 else next(iter(scenarios.TASK_SCENARIOS))
         mentioned = parsed.get("mentioned") if isinstance(parsed.get("mentioned"), str) else None
         mentioned = mentioned.strip() if mentioned and mentioned.strip() in content else None
-        chosen = [item for item in parsed.get("scenes") or [] if isinstance(item, str) and item in by_id]
-        # Keep the model's scenes only when grounded: attached, named in the message
-        # (checked against the scene description), or used by the previous run.
-        grounded, source = [], None
-        for item in chosen:
-            if item in attachments:
-                grounded.append(item)
-                source = source or "attachment"
-            elif mentioned and mentions_scene(mentioned, by_id[item]):
-                grounded.append(item)
-                source = source or "message"
-            elif item in previous:
-                grounded.append(item)
-                source = source or "previous_run"
-        if not grounded and attachments:
-            grounded, source = list(attachments), "attachment"
-        matched_collections = (
-            {scene["collection_id"] for scene in by_id.values() if mentions_scene(mentioned, scene)} if mentioned else set()
-        )
-        if not grounded and matched_collections:
-            source = "message"
-        if not grounded and not matched_collections and developer:
-            synthetic = [s["id"] for s in by_id.values() if s["category"] == "synthetic" and not s.get("self_check_for")]
-            grounded, source = synthetic, ("keyword" if synthetic else None)
-        roles, notes = {}, []
+        place = parsed.get("place") if parsed.get("place") in place_names else None
+        # Keep the model's place only when it is grounded in the message, the attachments or the previous run.
+        grounded_by = None
+        if place:
+            if any(scenario_inputs.place_of(views[i]) == place for i in attachments):
+                grounded_by = "attachment"
+            elif mentions_place(content, place, places):
+                grounded_by = "message"
+            elif previous and scenario_inputs.place_of(views[previous[0]]) == place:
+                grounded_by = "previous_run"
+            else:
+                place = None
+        if place is None and mentioned:
+            matches = [name for name in place_names if mentions_place(mentioned, name, places)]
+            if len(matches) == 1:
+                place, grounded_by = matches[0], "message"
+        roles, notes, source = {}, [], None
         if action == "run" and scenario:
-            roles, notes = assign_roles(
-                scenarios.TASK_SCENARIOS[scenario], grounded, matched_collections, by_id, content
+            roles, notes, source = scenario_inputs.resolve(
+                scenarios.TASK_SCENARIOS[scenario], entries, place=place, content=content,
+                attachments=attachments, previous=previous if grounded_by == "previous_run" or not place else [],
             )
         return {
             "action": action,
             "scenario": scenario,
             "roles": roles,
             "notes": notes,
+            "place": place,
             "mentioned": mentioned,
-            "matched_by": source if roles else None,
-            "unmatched": bool(parsed.get("unmatched")) and not roles and bool(mentioned) and not matched_collections,
+            "matched_by": (grounded_by or source) if roles else None,
+            "unmatched": bool(parsed.get("unmatched")) and not roles and bool(mentioned) and place is None,
         }
 
     def handle_message(self, conversation_id: str, content: str, attachments: list[str]) -> Iterator[Event]:
@@ -338,25 +340,31 @@ class WorkspaceAgent:
 
     def _propose(self, conversation_id: str, content: str, decision: dict[str, Any]) -> Iterator[Event]:
         spec = scenarios.TASK_SCENARIOS[decision["scenario"]]
-        needed = [item["role"] for item in spec["inputs"]]
+        needed = [item["role"] for item in spec["slots"]]
         if any(role not in decision["roles"] for role in needed):
             if decision["unmatched"]:
                 text = (
-                    f"现有数据里没有「{decision['mentioned']}」。可以到“数据”上传对应影像，"
-                    f"或者用“＋ 添加数据”选择现有影像再试。"
+                    f"现有数据里没有「{decision['mentioned']}」。可以到“数据”上传对应数据，"
+                    f"或者用“＋ 添加数据”选择现有数据再试。"
+                )
+            elif decision.get("place"):
+                missing = [s["label"] for s in spec["slots"] if s["role"] not in decision["roles"]]
+                text = (
+                    f"「{decision['place']}」现有的数据不够运行「{spec['title']}」：缺少{'、'.join(missing)}。"
+                    f"可以到“数据”上传，或换一个地点。"
                 )
             else:
-                needs = "、".join(item["label"] for item in spec["inputs"])
+                needs = "、".join(item["label"] for item in spec["slots"])
                 text = (
-                    f"要运行「{spec['title']}」，需要指定{needs}。请用“＋ 添加数据”选择影像，或在任务里说明地点和日期。"
+                    f"要运行「{spec['title']}」，需要{needs}。请在任务里说明地点（和日期），或用“＋ 添加数据”选择数据。"
                 )
             yield from self._say(conversation_id, text)
             return
-        scenes, problem = self.web.LIBRARY.check_inputs(spec, decision["roles"])
+        chosen, problem = scenario_inputs.check(spec, decision["roles"], self.web.CATALOG)
         if problem:
             yield from self._say(conversation_id, problem)
             return
-        first = next(iter(scenes.values()))
+        kind, scale = scenario_inputs.input_kind(chosen)
         yield "status", {"text": "正在规划工具顺序…"}
         runner = self.web._RUNNER
         try:
@@ -368,13 +376,14 @@ class WorkspaceAgent:
                 model,
                 tools,
                 user_prompt=content,
-                input_kind=first["input_kind"],
+                input_kind=kind,
                 task=spec["id"],
+                fixture_meta={"has_cloud_mask": "cloud-mask" in (chosen.get("scene") or {}).get("item", {}).get("assets", {})},
             )
         except runner.DemoError as exc:
             yield from self._say(conversation_id, f"没能生成可执行的计划：{exc}")
             return
-        inputs = plan_inputs(spec, scenes)
+        inputs = scenario_inputs.plan_inputs(spec, chosen)
         message = self.store.append(
             conversation_id,
             {
@@ -388,8 +397,9 @@ class WorkspaceAgent:
                     "scenario_title": spec["title"],
                     "inputs": inputs,
                     "input_title": describe_inputs({"inputs": inputs}),
-                    "input_kind": first["input_kind"],
-                    "input_scale": first.get("input_scale"),
+                    "input_kind": kind,
+                    "input_scale": scale,
+                    "place": decision.get("place"),
                     "self_check_available": spec["id"] == "water_change",
                     "execution_order": plan["execution_order"],
                     "removed_duplicates": plan.get("removed_duplicates") or [],
@@ -412,7 +422,9 @@ class WorkspaceAgent:
                 for spec in scenarios.scenario_catalog()
             ],
             # Test fixtures and test uploads are not offered to users unless they ask for them.
-            "scenes": self._scenes(include_developer=any(w in content for w in ("合成", "测试", "开发"))),
+            "data": scenario_inputs.data_summary(
+                self.web.CATALOG, include_developer=any(w in content for w in ("合成", "测试", "开发"))
+            ),
             "latest_result": {
                 "scenario": last.get("scenario"),
                 "data": last.get("input_title"),
@@ -484,12 +496,11 @@ class WorkspaceAgent:
         changed = bool(inputs) and any(inputs.get(role, roles[role]) != roles[role] for role in roles)
         if changed:
             roles = {role: str(inputs.get(role) or roles[role]) for role in roles}
-        scenes, problem = self.web.LIBRARY.check_inputs(spec, roles)
+        scenes, problem = scenario_inputs.check(spec, roles, self.web.CATALOG)
         if problem:
             yield "error", {"text": problem}
             return
-        first = next(iter(scenes.values()))
-        if (first["input_kind"], first.get("input_scale")) != (plan["input_kind"], plan.get("input_scale")):
+        if scenario_inputs.input_kind(scenes) != (plan["input_kind"], plan.get("input_scale") or "linear"):
             # The confirmed tool order depends on the data kind; a different kind needs a new plan.
             yield "error", {"text": "更换后的影像与计划的数据类型不同，请重新提问生成计划。"}
             return
@@ -497,7 +508,7 @@ class WorkspaceAgent:
             yield "error", {"text": "已有任务在运行，请稍后再执行。"}
             return
         if changed:
-            inputs_list = plan_inputs(spec, scenes)
+            inputs_list = scenario_inputs.plan_inputs(spec, scenes)
             plan = {**plan, "inputs": inputs_list, "input_title": describe_inputs({"inputs": inputs_list}),
                     "inputs_changed_by_user": True}
             self.store.update(conversation_id, message_id, plan=plan)
@@ -530,8 +541,8 @@ class WorkspaceAgent:
         try:
             if self_check and plan["scenario"] == "water_change":
                 events.put(("status", {"text": "正在准备门控自检样本…"}))
-            input_dir, self_check_ready = self.web.LIBRARY.prepare_inputs(
-                plan["scenario"], scenes, plan_message["id"], self_check
+            input_dir, self_check_ready = scenario_inputs.prepare(
+                self.web, plan["scenario"], scenes, plan_message["id"], self_check
             )
             job_dir = self.web.JOB_DIR
             plan_file = job_dir / f"{plan_message['id']}.plan.json"
@@ -591,7 +602,7 @@ class WorkspaceAgent:
             summary["web_request"] = {
                 "prompt": plan_message.get("request"),
                 "entrypoint": "agent-workspace",
-                "scenes": {role: scene["id"] for role, scene in scenes.items()},
+                "scenes": {role: value["item"]["id"] for role, value in scenes.items()},
                 "conversation_id": conversation_id,
                 "plan_message_id": plan_message["id"],
                 "self_check": bool(self_check),
@@ -657,6 +668,17 @@ class WorkspaceAgent:
 
 _MONTH_DAY = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日?")
 _ISO_DATE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+
+
+def mentions_place(text: str | None, place: str, places: list[dict[str, Any]] | None = None) -> bool:
+    """True when the text shares a two-character piece (or an English word) with the place name."""
+    if not text:
+        return False
+    name, words = place.lower(), text.lower()
+    pieces = {words[i : i + 2] for i in range(len(words) - 1)}
+    if any(len(piece.strip()) == 2 and not piece.isascii() and piece in name for piece in pieces):
+        return True
+    return any(len(word) >= 4 and word in name for word in re.findall(r"[a-z]+", words))
 
 
 def mentions_scene(mentioned: str | None, scene: dict[str, Any]) -> bool:

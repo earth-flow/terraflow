@@ -554,6 +554,8 @@ def canvas_template_for_scenes(
     spec = workspace_scenarios.TASK_SCENARIOS.get(scenario_id)
     if spec is None:
         return 404, {"status": "not_found", "error": "场景不存在"}
+    if not spec.get("canvas_template"):
+        return 400, {"status": "invalid_request", "error": f"「{spec['title']}」暂时没有 Canvas 模板。"}
     scenes, problem = LIBRARY.check_inputs(spec, inputs)
     if problem:
         return 400, {"status": "invalid_request", "error": problem}
@@ -651,7 +653,13 @@ RUN_PREVIEWS = ("before", "after", "before_mask", "after_mask", "scene", "scene_
 def run_preview(run_id: str, name: str) -> Path | None:
     summary_file = summary_path_for(run_id)
     summary = read_json(summary_file) if summary_file else None
-    if not isinstance(summary, dict) or name not in RUN_PREVIEWS:
+    if not isinstance(summary, dict):
+        return None
+    # Runs of the newer scenarios list their map layers (file and how to draw it) in the summary.
+    layer = ((summary.get("success_chain") or {}).get("layers") or {}).get(name)
+    if isinstance(layer, dict) and layer.get("path"):
+        return CATALOG.render_layer(Path(layer["path"]), layer)
+    if name not in RUN_PREVIEWS:
         return None
     fixtures = summary.get("fixtures") or {}
     sar = fixtures.get("input_kind") == "sar_backscatter"

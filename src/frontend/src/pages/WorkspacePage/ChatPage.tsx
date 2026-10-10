@@ -16,17 +16,17 @@ import {
   displayTool,
   postJson,
   readEvents,
-  useScenes,
+  useCatalog,
 } from "./api";
+import ItemPicker from "./ItemPicker";
 import ResultView from "./ResultView";
-import ScenePicker from "./ScenePicker";
 import type {
+  CatalogItem,
   ChatMessage,
   Conversation,
   GenericResult,
   PlanInput,
   Scenario,
-  Scene,
   StepEvent,
 } from "./types";
 
@@ -38,6 +38,12 @@ type Live = {
   result?: { run_id: string; result: GenericResult };
 };
 
+// Plans written before input slots carry only the runner's input kind.
+const LEGACY_CAPABILITY: Record<string, string> = {
+  sar_backscatter: "sar_vv",
+  water_labels: "water_mask",
+  optical_reflectance: "optical_green_nir",
+};
 const MATCHED_BY: Record<string, string> = {
   attachment: "你添加的数据",
   message: "任务中提到的地点",
@@ -129,11 +135,11 @@ function PlanInputRow({
 }: {
   input: PlanInput;
   value: string;
-  options: Scene[];
+  options: CatalogItem[];
   editable: boolean;
   onChange: (sceneId: string) => void;
 }) {
-  const chosen = options.find((scene) => scene.id === value);
+  const chosen = options.find((item) => item.id === value);
   const preview = chosen?.preview ?? input.preview;
   return (
     <div className="flex items-center gap-3 rounded-xl border border-border bg-background p-2">
@@ -155,9 +161,9 @@ function PlanInputRow({
             onChange={(event) => onChange(event.target.value)}
             className="mt-1 w-full rounded-lg border border-input bg-background px-2 py-1"
           >
-            {options.map((scene) => (
-              <option key={scene.id} value={scene.id}>
-                {scene.collection_title} · {scene.acquired ?? scene.title}
+            {options.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.collection_title} · {item.date ?? item.title}
               </option>
             ))}
           </select>
@@ -165,7 +171,7 @@ function PlanInputRow({
           <p className="mt-0.5 truncate text-muted-foreground">
             {(chosen?.collection_title ?? input.collection_title) +
               " · " +
-              (chosen?.acquired ?? input.acquired ?? input.scene_title)}
+              (chosen?.date ?? input.acquired ?? input.scene_title)}
           </p>
         )}
       </div>
@@ -177,14 +183,14 @@ function PlanCard({
   message,
   live,
   busy,
-  scenes,
+  items,
   onExecute,
   onCancel,
 }: {
   message: ChatMessage;
   live?: Live;
   busy: boolean;
-  scenes: Scene[];
+  items: CatalogItem[];
   onExecute: (selfCheck: boolean, inputs?: Record<string, string>) => void;
   onCancel: () => void;
 }) {
@@ -196,14 +202,16 @@ function PlanCard({
       (plan.inputs ?? []).map((input) => [input.role, input.scene_id]),
     ),
   );
-  // Swapping is limited to scenes of the same data kind: the tool order depends on it.
-  const options = scenes.filter(
-    (scene) =>
-      !scene.self_check_for &&
-      scene.input_kind === plan.input_kind &&
-      (scene.input_scale ?? "linear") === (plan.input_scale ?? "linear") &&
-      (scene.audience === "user" || Object.values(roles).includes(scene.id)),
-  );
+  // Swapping is limited to data that fills the slot the same way: the tool order depends on it.
+  const optionsFor = (input: PlanInput) =>
+    items.filter(
+      (item) =>
+        !item.self_check_for &&
+        item.capabilities.includes(
+          input.capability ?? LEGACY_CAPABILITY[plan.input_kind] ?? "",
+        ) &&
+        (item.audience === "user" || Object.values(roles).includes(item.id)),
+    );
   const chosen = Object.values(roles);
   const duplicate = new Set(chosen).size < chosen.length;
   return (
@@ -231,7 +239,7 @@ function PlanCard({
               key={input.role}
               input={input}
               value={roles[input.role]}
-              options={options}
+              options={optionsFor(input)}
               editable={status === "pending"}
               onChange={(sceneId) =>
                 setRoles((current) => ({ ...current, [input.role]: sceneId }))
@@ -339,14 +347,14 @@ function MessageView({
   message,
   live,
   busy,
-  scenes,
+  items,
   onExecute,
   onCancel,
 }: {
   message: ChatMessage;
   live?: Live;
   busy: boolean;
-  scenes: Scene[];
+  items: CatalogItem[];
   onExecute: (
     id: string,
     selfCheck: boolean,
@@ -361,7 +369,7 @@ function MessageView({
           <p className="whitespace-pre-wrap">{message.content}</p>
           {message.attachments?.length ? (
             <p className="mt-1 text-xs opacity-80">
-              附加数据：{message.attachments.length} 景
+              附加数据：{message.attachments.length} 份
             </p>
           ) : null}
         </div>
@@ -374,7 +382,7 @@ function MessageView({
         message={message}
         live={live}
         busy={busy}
-        scenes={scenes}
+        items={items}
         onExecute={(selfCheck, inputs) =>
           onExecute(message.id, selfCheck, inputs)
         }
@@ -411,7 +419,7 @@ export default function ChatPage() {
   const { conversationId } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { scenes, collections } = useScenes();
+  const { items, collections } = useCatalog();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
@@ -610,7 +618,7 @@ export default function ChatPage() {
     }
   }
 
-  const attached = scenes.filter((item) => attachments.includes(item.id));
+  const attached = items.filter((item) => attachments.includes(item.id));
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0">
@@ -702,7 +710,7 @@ export default function ChatPage() {
                 message={message}
                 live={live && live.planId === message.id ? live : undefined}
                 busy={busy}
-                scenes={scenes}
+                items={items}
                 onExecute={(id, selfCheck, inputs) =>
                   void execute(id, selfCheck, inputs)
                 }
@@ -724,19 +732,19 @@ export default function ChatPage() {
             {picker && (
               <div className="mb-3 max-h-96 overflow-y-auto rounded-2xl border border-border bg-card p-3">
                 <p className="mb-3 text-xs text-muted-foreground">
-                  选择要分析的影像（最多 {MAX_ATTACHMENTS}{" "}
-                  景）。比较变化选两景，提取水体选一景；用途由 Agent
+                  选择要分析的数据（最多 {MAX_ATTACHMENTS}{" "}
+                  份）。只列出现有场景能用的数据；用途由 Agent
                   在计划里指定，执行前可以更换。
                 </p>
-                <ScenePicker
-                  scenes={scenes}
+                <ItemPicker
+                  items={items}
                   collections={collections}
                   selected={attachments}
-                  onToggle={(scene) =>
+                  onToggle={(item) =>
                     setAttachments((current) =>
-                      current.includes(scene.id)
-                        ? current.filter((id) => id !== scene.id)
-                        : current.concat(scene.id).slice(-MAX_ATTACHMENTS),
+                      current.includes(item.id)
+                        ? current.filter((id) => id !== item.id)
+                        : current.concat(item.id).slice(-MAX_ATTACHMENTS),
                     )
                   }
                 />
@@ -749,7 +757,7 @@ export default function ChatPage() {
                     key={item.id}
                     className="ws-chip flex items-center gap-1 rounded-full px-2 py-1 text-xs"
                   >
-                    {item.collection_title} · {item.acquired ?? item.title}
+                    {item.collection_title} · {item.date ?? item.title}
                     <button
                       type="button"
                       aria-label="移除数据"

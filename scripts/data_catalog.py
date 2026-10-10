@@ -203,16 +203,21 @@ class DataCatalog:
             "band_count": len(bands),
             "preview": f"/api/workspace/items/{item['id']}/preview",
             "usable_in": usable,
+            "capabilities": capabilities(item),
         }
 
     @staticmethod
     def _usable_in(item: dict[str, Any]) -> list[str]:
-        p = item["properties"]
-        if p.get("workspace:legacy_id"):
-            usable = not p.get("workspace:self_check_for")
-        else:
-            usable = item_scene(item, {"id": item.get("collection"), "title": ""}) is not None
-        return ["water_change", "water_extent"] if usable else []
+        """Scenarios with at least one input slot this item can fill."""
+        import workspace_scenarios
+
+        if item["properties"].get("workspace:self_check_for"):
+            return []
+        caps = set(capabilities(item))
+        return [
+            spec["id"] for spec in workspace_scenarios.TASK_SCENARIOS.values()
+            if any(caps & set(slot["accepts"]) for slot in spec["slots"])
+        ]
 
     def collections(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
@@ -338,6 +343,18 @@ class DataCatalog:
             classes = data.get("classification:classes") or []
             palette = {str(c["value"]): c.get("color_hint") for c in classes if c.get("color_hint") and not c.get("nodata")}
             return self._render(self.raster_renderer, source, ["--mode", "classes", "--palette", json.dumps(palette)])
+        return None
+
+    def render_layer(self, source: Path, layer: dict[str, Any]) -> Path | None:
+        """A run's map layer: 0/1 labels, a continuous index, or class codes with a palette."""
+        mode = layer.get("mode")
+        if mode == "classes":
+            return self._render(self.raster_renderer, source, ["--mode", "classes", "--palette",
+                                                               json.dumps(layer.get("palette") or {})])
+        if mode in ("labels", "continuous"):
+            return self._render(self.raster_renderer, source, ["--mode", mode])
+        if mode == "sar":
+            return self._render(self.raster_renderer, source, ["--mode", "sar", "--scale", layer.get("scale", "linear")])
         return None
 
     def _render(self, renderer: Path, source: Path, args: list[str]) -> Path | None:
@@ -719,6 +736,35 @@ def legacy_item(scene: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any
         "links": links,
         "assets": {"data": asset},
     }
+
+
+CAPABILITY_LABELS = {
+    "sar_vv": "SAR 后向散射（含 VV）",
+    "water_mask": "0/1 水体栅格",
+    "optical_green_nir": "光学反射率（含 green、nir）",
+    "landcover": "土地覆盖等分类栅格",
+    "reference_extent": "参考水体范围（矢量）",
+}
+
+
+def capabilities(item: dict[str, Any]) -> list[str]:
+    """What a scenario input slot can use this item as; derived from the STAC fields, never stored."""
+    p = item["properties"]
+    data_type = p.get("workspace:data_type")
+    assets = item.get("assets") or {}
+    data = assets.get("data") or {}
+    out = []
+    if data_type == "sar" and "VV" in [b.get("name") for b in data.get("bands") or []]:
+        out.append("sar_vv")
+    if data_type == "classification":
+        out.append("water_mask" if _is_water_binary(data.get("classification:classes") or []) else "landcover")
+    if data_type == "optical":
+        names = {b.get("eo:common_name") for k, a in assets.items() if k != "cloud-mask" for b in a.get("bands") or []}
+        if {"green", "nir"} <= names:
+            out.append("optical_green_nir")
+    if data_type == "vector" and p.get("workspace:purpose") == "reference":
+        out.append("reference_extent")
+    return out
 
 
 def _is_water_binary(classes: list[dict[str, Any]]) -> bool:

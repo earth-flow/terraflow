@@ -79,7 +79,9 @@ export type Scenario = {
   title: string;
   summary: string;
   inputs: { role: string; label: string }[];
-  input_kinds: string[];
+  /** Only on scenarios with a Canvas template. */
+  input_kinds?: string[];
+  canvas_template?: boolean;
   requirements: string[];
   outputs: string[];
   tools: string[];
@@ -144,6 +146,9 @@ export type PlanInput = {
   collection_title: string;
   acquired?: string | null;
   preview?: string;
+  /** How the item fills the slot (e.g. sar_vv); absent on plans before input slots. */
+  capability?: string;
+  accepts?: string[];
 };
 
 export type PlanInfo = {
@@ -212,6 +217,7 @@ export type CatalogItem = {
   band_count: number;
   preview: string;
   usable_in: string[];
+  capabilities: string[];
 };
 
 export type CatalogCollection = {

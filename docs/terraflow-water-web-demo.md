@@ -118,6 +118,30 @@ ssh -N -L 14173:127.0.0.1:4173 L20X4-bhc
 
 与场景的关系：两个水体场景仍只接受 SAR 后向散射和 0/1 水体标签。新上传的 SAR 条目只要有 VV 波段即可使用，多波段文件在运行时把 VV 波段写成单独文件（运行输入的 `fixture.json` 记录 `band_extracted`）；类别表恰为 `0 non_water / 1 water` 的分类栅格可以作为水体标签使用。光学、DEM、矢量和其他分类栅格可以上传、查看和查询，分析场景尚未接入。多波段 SAR 不写入 Canvas 的 `scene-index.json`，因为 Canvas 工具读取第一个波段。
 
+## 场景输入槽与按地点查询（2026-10-10 起，N040）
+
+每个场景用输入槽声明需要什么数据（`workspace_scenarios.TASK_SCENARIOS[...]["slots"]`）：角色、标签和可接受的“用途”。用途由 STAC 条目推导（`data_catalog.capabilities`），不另外存储：
+
+| 用途 | 来自 |
+| --- | --- |
+| `sar_vv` | SAR 条目含 VV 波段 |
+| `water_mask` | 类别表为 `0 non_water / 1 water` 的分类栅格 |
+| `optical_green_nir` | 光学条目含 green、nir 标准波段 |
+| `landcover` | 其他分类栅格（如 WorldCover） |
+| `reference_extent` | 用途为“参考范围”的矢量 |
+
+| 场景 | 输入槽 | 工具链（规划模型在其中选择顺序，参数由预设决定） |
+| --- | --- | --- |
+| 水体变化 | 前期、后期（`sar_vv` 或 `water_mask`） | 不变 |
+| 单景水体提取 | 影像 | 不变 |
+| 光学水体提取 | 光学影像（`optical_green_nir`） | 网格检查 → `geo_raster.calculate_index`（NDWI）→ `apply_cloud_mask`（SCL 3/8/9/10）→ 阈值（NDWI > 0）→ `water_extent` |
+| 淹没区土地覆盖统计 | 前期、后期、土地覆盖 | 水体变化链 → `geo_water.water_by_class` |
+| 与参考范围对比 | 影像、参考范围 | 阈值 → `water_extent`（可选）→ `geo_water.compare_with_reference` |
+
+规划模型不再看到数据列表。`scenario_inputs.places()` 给它每个地点有哪些类型、哪些日期；模型返回场景、地点（必须是列表中的名称，且能在消息、附件或上一次运行中找到依据）和是否找不到；`scenario_inputs.resolve()` 按地点、用途和消息中的日期确定性地填槽（两期按日期排序，优先新上传的组；参考对比的影像取与参考日期最近的一期；附件优先）。执行前 `check()` 再校验用途、前后日期顺序和 SAR 数值尺度；计划卡片里只能换成同一用途的数据。
+
+运行输入由 `scenario_inputs.prepare()` 写入 `run-inputs/<计划消息 id>/`：SAR 与 0/1 标签沿用原方式；光学的 green/nir 按条目登记的 scale/offset 换算为反射率，SCL 用最近邻对齐到 green 的网格；土地覆盖用最近邻重投影到后期影像网格；参考矢量按像元中心栅格化到影像网格。这些由 `scripts/align_inputs.py` 在地理处理环境中完成，每一步的方法写入 `fixture.json` 的 `alignment`，结果卡片的“适用边界”会列出。新场景的地图图层由 runner 写在运行摘要 `success_chain.layers` 中，预览接口按其中的绘制方式渲染。Canvas 模板仍只支持两个水体场景。
+
 ## 页面能展示什么
 
 - 会话消息列表。每次提交时，最近 6 条消息会作为上下文传给 Qwen 规划；超出长度时先丢弃最早的消息，当前任务不会被截断。

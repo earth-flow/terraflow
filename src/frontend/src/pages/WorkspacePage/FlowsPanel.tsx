@@ -67,15 +67,17 @@ export default function FlowsPanel({ scenes }: { scenes: Scene[] }) {
   useEffect(() => {
     void apiJson<{ scenarios: Scenario[] }>(API + "/scenarios")
       .then((body) => {
-        setScenarios(body.scenarios);
-        setScenarioId((current) => current || body.scenarios[0]?.id || "");
+        // Canvas templates exist only for the scenarios the flow builder knows.
+        const canvas = body.scenarios.filter((item) => item.canvas_template);
+        setScenarios(canvas);
+        setScenarioId((current) => current || canvas[0]?.id || "");
       })
       .catch(() => undefined);
   }, []);
 
   const scenario = scenarios.find((item) => item.id === scenarioId);
   const choices = pickableScenes(scenes, false).filter((scene) =>
-    scenario?.input_kinds.includes(scene.input_kind),
+    scenario?.input_kinds?.includes(scene.input_kind),
   );
   const ready =
     scenario?.inputs.every((input) => roles[input.role]) &&

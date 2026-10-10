@@ -7,8 +7,13 @@ runner validates that choice against the catalog, then applies the raster
 preflight gate before any pairwise operation.  It records the Terrabox
 execution id, manifest path, and analytics trace for every call.
 
-Two tasks share the runner: ``water_change`` compares before.tif and
-after.tif on one grid; ``water_extent`` measures water in a single scene.tif.
+Tasks share the runner: ``water_change`` compares before.tif and after.tif
+on one grid; ``water_extent`` measures water in a single scene.tif;
+``optical_water`` thresholds NDWI from green.tif/nir.tif (cloud.tif: an
+aligned Sentinel-2 SCL); ``landcover_impact`` adds water area per class of an
+aligned landcover.tif to the paired change; ``reference_compare`` compares the
+water mask of scene.tif with an aligned 0/1 reference.tif. Alignment onto the
+run grid is done by the workspace before the run and recorded in fixture.json.
 Inputs are described by an optional fixture.json: 0/1 water labels (the
 synthetic engineering fixture when the file is absent) or SAR backscatter,
 which is first turned into threshold water masks.  Results do not claim
@@ -76,6 +81,22 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "the runner fills threshold direction and units from the scenario preset."
         ),
     },
+    "optical_reflectance": {
+        "derive_labels": {
+            "tool": "geo_raster.threshold_segmentation",
+            "preset": "optical_ndwi_water",
+            "params": {"direction": "above", "foreground_value": 1, "background_value": 0, "nodata_value": 255},
+            "transform_by_scale": {"linear": "none"},
+            "fixed_threshold": 0.0,
+            "units": "NDWI",
+            "rule": "NDWI = (green - nir) / (green + nir) on surface reflectance; water where NDWI > 0 (McFeeters 1996)",
+        },
+        "planner_note": (
+            "Inputs are green and near-infrared surface reflectance on one grid. Compute NDWI with "
+            "geo_raster.calculate_index, mask clouds, then threshold; the runner fills bands, "
+            "threshold and direction from the scenario preset."
+        ),
+    },
 }
 # Tasks: which tools a plan may use and the minimum plan size. Ordering rules
 # live in validate_order and apply to model plans and confirmed plans alike.
@@ -105,6 +126,48 @@ TASKS: dict[str, dict[str, Any]] = {
         ],
         "default_prompt": "Select an executable ordered plan to measure water in one GeoTIFF scene.",
     },
+}
+TASKS["optical_water"] = {
+    "tools": (
+        "raster_viewer.inspect_geotiff",
+        "geo_water.raster_profile_preflight",
+        "geo_raster.calculate_index",
+        "geo_raster.apply_cloud_mask",
+        "geo_raster.threshold_segmentation",
+        "geo_water.water_extent",
+    ),
+    "min_tools": 4,
+    "constraints": [
+        "Run geo_water.raster_profile_preflight on the green and near-infrared bands before computing NDWI.",
+        "Compute NDWI with geo_raster.calculate_index before masking clouds and thresholding.",
+        "Mask clouds with geo_raster.apply_cloud_mask (when offered) before thresholding.",
+        "End with geo_water.water_extent, which checks labels and the area grid before measuring water.",
+    ],
+    "default_prompt": "Select an executable ordered plan to extract water from optical reflectance with NDWI.",
+}
+TASKS["landcover_impact"] = {
+    "tools": CORE_TOOL_SLUGS + ("geo_water.water_by_class",),
+    "min_tools": 5,
+    "constraints": [
+        *TASKS["water_change"]["constraints"],
+        "Run geo_water.water_by_class after geo_water.water_evidence to split new water by land-cover class.",
+    ],
+    "default_prompt": "Select an executable ordered plan for new water area per land-cover class.",
+}
+TASKS["reference_compare"] = {
+    "tools": (
+        "raster_viewer.inspect_geotiff",
+        "geo_raster.threshold_segmentation",
+        "geo_water.water_extent",
+        "geo_water.compare_with_reference",
+    ),
+    "min_tools": 3,
+    "constraints": [
+        "There is one scene and one reference water raster on the same grid.",
+        "Inspect the scene first; derive the water mask before comparing.",
+        "End with geo_water.compare_with_reference.",
+    ],
+    "default_prompt": "Select an executable ordered plan to compare a water mask with a reference extent.",
 }
 PAIRWISE_TOOL_SLUGS = {
     "geo_water.raster_profile_preflight",
@@ -340,11 +403,12 @@ def plan_with_model(
     user_prompt: str | None = None,
     input_kind: str = "water_labels",
     task: str = "water_change",
+    fixture_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scenario = SCENARIOS[input_kind]
     spec = TASKS[task]
     derive = scenario["derive_labels"]
-    candidates = applicable_candidates(tools, input_kind, task)
+    candidates = applicable_candidates(tools, input_kind, task, fixture_meta)
     if derive and derive["tool"] not in {item["slug"] for item in candidates}:
         raise DemoError(f"{input_kind} input needs {derive['tool']}, which Terrabox does not report as available")
     if len(candidates) < spec["min_tools"]:
@@ -417,17 +481,26 @@ def plan_with_model(
 
 
 def _measure_tool(task: str) -> str:
-    return "geo_water.water_extent" if task == "water_extent" else "geo_water.water_evidence"
+    return {
+        "water_extent": "geo_water.water_extent",
+        "optical_water": "geo_water.water_extent",
+        "reference_compare": "geo_water.compare_with_reference",
+    }.get(task, "geo_water.water_evidence")
 
 
 def applicable_candidates(
-    tools: dict[str, dict[str, Any]], input_kind: str, task: str = "water_change"
+    tools: dict[str, dict[str, Any]],
+    input_kind: str,
+    task: str = "water_change",
+    fixture_meta: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     derive = SCENARIOS[input_kind]["derive_labels"]
     allowed = TASKS[task]["tools"]
-    if task == "water_extent" and not derive:
+    if task in ("water_extent", "reference_compare") and not derive:
         # Label scenes are already water masks; there is nothing to threshold.
         allowed = tuple(slug for slug in allowed if slug != "geo_raster.threshold_segmentation")
+    if task == "optical_water" and not (fixture_meta or {}).get("has_cloud_mask", True):
+        allowed = tuple(slug for slug in allowed if slug != "geo_raster.apply_cloud_mask")
     return [
         {
             "slug": slug,
@@ -456,6 +529,31 @@ def validate_order(
         raise DemoError("Plan uses a tool outside the live applicable catalog")
     if set(order) != set(selected):
         raise DemoError("Plan execution_order must contain exactly the selected tools")
+    if task == "optical_water":
+        required = ("geo_water.raster_profile_preflight", "geo_raster.calculate_index",
+                    "geo_raster.threshold_segmentation", "geo_water.water_extent")
+        missing = [slug for slug in required if slug not in order]
+        if missing:
+            raise DemoError("Plan omits required optical water steps: " + ", ".join(missing))
+        chain = [slug for slug in (*required[:2], "geo_raster.apply_cloud_mask", *required[2:]) if slug in order]
+        if [slug for slug in order if slug in chain] != chain:
+            raise DemoError("Optical plan must run preflight, NDWI, cloud mask, threshold and water extent in that order")
+        return
+    if task == "reference_compare":
+        if "geo_water.compare_with_reference" not in order:
+            raise DemoError("Plan omits geo_water.compare_with_reference")
+        if order[-1] != "geo_water.compare_with_reference":
+            raise DemoError("Plan must end with geo_water.compare_with_reference")
+        if derive and derive["tool"] not in order:
+            raise DemoError(f"Plan must run {derive['tool']} before comparing {input_kind} input")
+        return
+    if task == "landcover_impact":
+        if "geo_water.water_by_class" not in order:
+            raise DemoError("Plan omits geo_water.water_by_class")
+        if "geo_water.water_evidence" in order and order.index("geo_water.water_by_class") < order.index(
+            "geo_water.water_evidence"
+        ):
+            raise DemoError("Plan places water_by_class before water evidence")
     if task == "water_extent":
         if "geo_water.water_extent" not in order:
             raise DemoError("Plan omits geo_water.water_extent, which checks labels and the area grid")
@@ -478,7 +576,11 @@ def validate_order(
 
 
 def confirmed_plan(
-    path: Path, tools: dict[str, dict[str, Any]], input_kind: str, task: str = "water_change"
+    path: Path,
+    tools: dict[str, dict[str, Any]],
+    input_kind: str,
+    task: str = "water_change",
+    fixture_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A plan the user already confirmed in the workspace; it is re-validated, never re-planned."""
     try:
@@ -486,7 +588,7 @@ def confirmed_plan(
     except (OSError, json.JSONDecodeError) as exc:
         raise DemoError(f"Confirmed plan is unreadable: {exc}") from exc
     order = [str(item) for item in stored.get("execution_order") or []]
-    candidates = applicable_candidates(tools, input_kind, task)
+    candidates = applicable_candidates(tools, input_kind, task, fixture_meta)
     validate_order(order, order, candidates, input_kind, task)
     return {
         "status": "confirmed_plan",
@@ -604,7 +706,20 @@ def tool_inputs(
     output_dir: Path,
     step: int,
     evidence_outputs: dict[str, Any],
+    extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    extras = extras or {}
+    if slug == "geo_water.water_by_class":
+        masks = evidence_outputs.get("water_masks") or {}
+        if not extras.get("landcover") or not extras.get("classes"):
+            raise DemoError("water_by_class needs an aligned land-cover raster and its class table")
+        return {
+            "before_path": masks.get("before", before),
+            "after_path": masks.get("after", after),
+            "class_path": extras["landcover"],
+            "classes": extras["classes"],
+            "output_path": str(output_dir / f"step_{step:02d}_new_water_by_class.tif"),
+        }
     if slug == "raster_viewer.inspect_geotiff":
         return {"raster_path": before, "include_histogram": False, "include_tags": True}
     if slug == "geo_water.raster_profile_preflight":
@@ -662,6 +777,7 @@ def run_success_chain(
     model_state: dict[str, Any],
     fixture_meta: dict[str, Any],
     progress_cb: ProgressCallback | None = None,
+    extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     evidence_outputs: dict[str, Any] = {}
@@ -721,6 +837,7 @@ def run_success_chain(
             output_dir=output_dir,
             step=step,
             evidence_outputs=evidence_outputs,
+            extras=extras,
         )
         record = call_tool(
             base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
@@ -739,6 +856,8 @@ def run_success_chain(
             if outputs.get("execution_blocked") or not outputs.get("change_answerable"):
                 return gate_refusal(record, outputs, fixture_type, records)
             evidence_outputs.update(outputs)
+        if slug == "geo_water.water_by_class" and outputs.get("execution_blocked"):
+            return gate_refusal(record, outputs, fixture_type, records)
     return {
         "status": "success",
         "fixture_type": fixture_type,
@@ -815,6 +934,169 @@ def run_extent_chain(
         "fixture_type": fixture_type,
         "execution_count": len(records),
         "derived_labels": derived,
+        "steps": records,
+    }
+
+
+def _run_step(
+    base_url: str, api_key: str, *, run_id: str, step: int, slug: str, inputs: dict[str, Any],
+    model_state: dict[str, Any], scenario: str, records: list[dict[str, Any]], target: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    record = call_tool(
+        base_url, api_key, run_id=run_id, chain="success", step=step, slug=slug,
+        inputs=inputs, model_state=model_state, scenario=scenario,
+    )
+    if target:
+        record["target"] = target
+    records.append(record)
+    outputs = record.get("outputs") if isinstance(record.get("outputs"), dict) else {}
+    if not record["success"] and not outputs.get("execution_blocked"):
+        raise DemoError(f"Success chain tool failed: {slug}: {record.get('error')}")
+    return record, outputs
+
+
+def run_optical_chain(
+    base_url: str,
+    api_key: str,
+    *,
+    run_id: str,
+    plan: dict[str, Any],
+    green: str,
+    nir: str,
+    cloud: str | None,
+    output_dir: Path,
+    model_state: dict[str, Any],
+    fixture_meta: dict[str, Any],
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """NDWI from aligned green/NIR reflectance, optional SCL cloud mask, fixed NDWI threshold, water extent."""
+    records: list[dict[str, Any]] = []
+    fixture_type = fixture_meta["type"]
+    scenario = "optical_water_ndwi"
+    derive = SCENARIOS["optical_reflectance"]["derive_labels"]
+    current, labels, cloud_pixels = None, None, None
+    layers: dict[str, Any] = {}
+    total = len(plan["execution_order"])
+    for step, slug in enumerate(plan["execution_order"], start=1):
+        if progress_cb:
+            progress_cb("executing_success", f"正在执行工具：{slug}", step, total, slug)
+        if slug == "raster_viewer.inspect_geotiff":
+            inputs = {"raster_path": green, "include_histogram": False, "include_tags": True}
+        elif slug == "geo_water.raster_profile_preflight":
+            inputs = {"before_path": green, "after_path": nir}
+        elif slug == "geo_raster.calculate_index":
+            inputs = {"band_a_path": green, "band_b_path": nir, "index_name": "NDWI",
+                      "output_path": str(output_dir / f"step_{step:02d}_ndwi.tif")}
+        elif slug == "geo_raster.apply_cloud_mask":
+            if not cloud or current is None:
+                raise DemoError("apply_cloud_mask needs an aligned SCL raster and the NDWI raster")
+            inputs = {"sr_path": current, "qa_path": cloud, "sensor": "sentinel2",
+                      "output_path": str(output_dir / f"step_{step:02d}_ndwi_clear.tif")}
+        elif slug == "geo_raster.threshold_segmentation":
+            if current is None:
+                raise DemoError("threshold_segmentation needs NDWI first")
+            inputs = {"_target": "scene", "input_path": current, **derive["params"], "input_transform": "none",
+                      "method": "fixed", "threshold": derive["fixed_threshold"],
+                      "output_path": str(output_dir / f"step_{step:02d}_water_mask.tif")}
+        elif slug == "geo_water.water_extent":
+            if labels is None:
+                raise DemoError("water_extent needs the NDWI water mask")
+            inputs = {"label_path": labels}
+        else:
+            raise DemoError(f"No safe input builder exists for selected tool {slug}")
+        record, outputs = _run_step(base_url, api_key, run_id=run_id, step=step, slug=slug,
+                                    inputs={k: v for k, v in inputs.items()}, model_state=model_state,
+                                    scenario=scenario, records=records,
+                                    target="scene" if slug == "geo_raster.threshold_segmentation" else None)
+        if outputs.get("execution_blocked"):
+            return gate_refusal(record, outputs, fixture_type, records) | {"layers": layers}
+        if slug == "geo_raster.calculate_index":
+            current = str(outputs.get("output_path") or inputs["output_path"])
+            layers["ndwi"] = {"path": current, "mode": "continuous"}
+        elif slug == "geo_raster.apply_cloud_mask":
+            current = str(outputs.get("output_path") or inputs["output_path"])
+            cloud_pixels = outputs.get("masked_pixels")
+            layers["ndwi"] = {"path": current, "mode": "continuous"}
+        elif slug == "geo_raster.threshold_segmentation":
+            labels = str(outputs.get("output_path") or inputs["output_path"])
+            layers["scene_mask"] = {"path": labels, "mode": "labels"}
+    return {
+        "status": "success",
+        "fixture_type": fixture_type,
+        "execution_count": len(records),
+        "derived_labels": {"tool": derive["tool"], "preset": derive["preset"], "threshold": derive["fixed_threshold"],
+                           "units": derive["units"], "rule": derive["rule"]},
+        "cloud_masked_pixels": cloud_pixels,
+        "layers": layers,
+        "steps": records,
+    }
+
+
+def run_compare_chain(
+    base_url: str,
+    api_key: str,
+    *,
+    run_id: str,
+    plan: dict[str, Any],
+    scene: str,
+    reference: str,
+    output_dir: Path,
+    model_state: dict[str, Any],
+    fixture_meta: dict[str, Any],
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Water mask of one scene (thresholded when SAR) compared with an aligned 0/1 reference raster."""
+    records: list[dict[str, Any]] = []
+    fixture_type = fixture_meta["type"]
+    scenario = f"reference_compare_{fixture_meta['input_kind']}"
+    derive = SCENARIOS[fixture_meta["input_kind"]]["derive_labels"]
+    labels = None if derive else scene
+    derived: dict[str, Any] | None = None
+    layers: dict[str, Any] = {"reference": {"path": reference, "mode": "labels"}}
+    total = len(plan["execution_order"])
+    for step, slug in enumerate(plan["execution_order"], start=1):
+        if progress_cb:
+            progress_cb("executing_success", f"正在执行工具：{slug}", step, total, slug)
+        if slug == "raster_viewer.inspect_geotiff":
+            inputs = {"raster_path": scene, "include_histogram": False, "include_tags": True}
+        elif slug == "geo_raster.threshold_segmentation" and derive:
+            inputs = {"_target": "scene", "input_path": scene, **derive["params"],
+                      "input_transform": derive["transform_by_scale"][fixture_meta.get("input_scale", "linear")],
+                      "method": "otsu", "otsu_range": derive["otsu_range"],
+                      "output_path": str(output_dir / f"step_{step:02d}_scene_water_mask.tif")}
+        elif slug == "geo_water.water_extent":
+            if labels is None:
+                raise DemoError("water_extent needs the water mask")
+            inputs = {"label_path": labels}
+        elif slug == "geo_water.compare_with_reference":
+            if labels is None:
+                raise DemoError("compare_with_reference needs the water mask")
+            inputs = {"predicted_path": labels, "reference_path": reference,
+                      "output_path": str(output_dir / f"step_{step:02d}_comparison.tif")}
+        else:
+            raise DemoError(f"No safe input builder exists for selected tool {slug}")
+        record, outputs = _run_step(base_url, api_key, run_id=run_id, step=step, slug=slug, inputs=inputs,
+                                    model_state=model_state, scenario=scenario, records=records,
+                                    target="scene" if slug == "geo_raster.threshold_segmentation" else None)
+        if outputs.get("execution_blocked"):
+            return gate_refusal(record, outputs, fixture_type, records) | {"layers": layers}
+        if slug == "geo_raster.threshold_segmentation":
+            labels = str(outputs.get("output_path") or inputs["output_path"])
+            layers["scene_mask"] = {"path": labels, "mode": "labels"}
+            derived = {"tool": slug, "preset": derive["preset"], "threshold": outputs.get("threshold"),
+                       "units": derive["units"], "rule": "Otsu on this scene"}
+        if slug == "geo_water.compare_with_reference":
+            layers["comparison"] = {
+                "path": str(outputs.get("output_path") or inputs["output_path"]),
+                "mode": "classes",
+                "palette": {"0": "d9dde3", "1": "2570eb", "2": "f08c2e", "3": "d6336c"},
+            }
+    return {
+        "status": "success",
+        "fixture_type": fixture_type,
+        "execution_count": len(records),
+        "derived_labels": derived,
+        "layers": layers,
         "steps": records,
     }
 
@@ -945,16 +1227,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         write_progress(progress_path, "starting", "正在启动水体 Agent")
         api_key = load_api_key(args.api_key_file, args.api_key)
-        if args.task == "water_extent":
+        files: dict[str, str] = {}
+        scene = before = after = mismatch = None
+        if args.task in ("water_extent", "reference_compare"):
             scene = require_file(args.fixtures_dir / "scene.tif", "scene")
-            before = after = mismatch = None
+            files["scene"] = scene
+            if args.task == "reference_compare":
+                files["reference"] = require_file(args.fixtures_dir / "reference.tif", "aligned reference")
+        elif args.task == "optical_water":
+            files["green"] = require_file(args.fixtures_dir / "green.tif", "green reflectance")
+            files["nir"] = require_file(args.fixtures_dir / "nir.tif", "near-infrared reflectance")
+            if (args.fixtures_dir / "cloud.tif").exists():
+                files["cloud"] = str(args.fixtures_dir / "cloud.tif")
         else:
-            scene = None
             before = require_file(args.fixtures_dir / "before.tif", "before fixture")
             after = require_file(args.fixtures_dir / "after.tif", "after fixture")
+            files.update(before=before, after=after)
+            if args.task == "landcover_impact":
+                files["landcover"] = require_file(args.fixtures_dir / "landcover.tif", "aligned land cover")
             mismatch_path = args.fixtures_dir / "mismatch.tif"
-            mismatch = str(mismatch_path) if mismatch_path.exists() else None
+            mismatch = str(mismatch_path) if mismatch_path.exists() and args.task == "water_change" else None
         fixture_meta = load_fixture_meta(args.fixtures_dir)
+        if args.task == "optical_water":
+            fixture_meta["has_cloud_mask"] = "cloud" in files
         args.summary_dir.mkdir(parents=True, exist_ok=True)
         output_dir = args.summary_dir / run_id / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -982,7 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
                 "llm_endpoint": args.llm_url,
             }
         if args.plan_file:
-            plan = confirmed_plan(args.plan_file, tools, fixture_meta["input_kind"], args.task)
+            plan = confirmed_plan(args.plan_file, tools, fixture_meta["input_kind"], args.task, fixture_meta)
         else:
             plan = plan_with_model(
                 args.llm_url,
@@ -991,6 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
                 user_prompt=args.prompt,
                 input_kind=fixture_meta["input_kind"],
                 task=args.task,
+                fixture_meta=fixture_meta,
             )
         emit_event("plan", execution_order=plan["execution_order"], status=plan["status"])
         summary: dict[str, Any] = {
@@ -1003,7 +1299,8 @@ def main(argv: list[str] | None = None) -> int:
             "branch": "feature/terraflow-water-demo",
             "fixtures": {
                 **fixture_meta,
-                **({"scene": scene} if scene else {"before": before, "after": after, "mismatch": mismatch}),
+                **files,
+                **({} if scene or args.task == "optical_water" else {"mismatch": mismatch}),
             },
             "catalog": catalog,
             "model": model_state,
@@ -1013,7 +1310,40 @@ def main(argv: list[str] | None = None) -> int:
         progress = lambda stage, message, current, total, tool: write_progress(  # noqa: E731
             progress_path, stage, message, current, total, tool
         )
-        if scene:
+        not_applicable = {
+            "status": "not_applicable",
+            "fixture_type": fixture_meta["type"],
+            "reason": "this task has no pair to mismatch",
+            "steps": [],
+        }
+        common = dict(run_id=run_id, plan=plan, output_dir=output_dir, model_state=model_state,
+                      fixture_meta=fixture_meta, progress_cb=progress)
+        if args.task == "optical_water":
+            summary["success_chain"] = run_optical_chain(
+                args.terrabox_url, api_key, green=files["green"], nir=files["nir"], cloud=files.get("cloud"), **common
+            )
+            summary["rejection_chain"] = not_applicable
+        elif args.task == "reference_compare":
+            summary["success_chain"] = run_compare_chain(
+                args.terrabox_url, api_key, scene=files["scene"], reference=files["reference"], **common
+            )
+            summary["rejection_chain"] = not_applicable
+        elif args.task == "landcover_impact":
+            chain = run_success_chain(
+                args.terrabox_url, api_key, before=before, after=after,
+                extras={"landcover": files["landcover"], "classes": fixture_meta.get("classes")}, **common
+            )
+            palette = {str(c["value"]): c["color_hint"] for c in fixture_meta.get("classes") or []
+                       if c.get("color_hint") and not c.get("nodata")}
+            chain["layers"] = {"landcover": {"path": files["landcover"], "mode": "classes", "palette": palette}}
+            by_class = next((s for s in chain["steps"] if s.get("tool_slug") == "geo_water.water_by_class"), None)
+            if by_class and (by_class.get("outputs") or {}).get("output_path"):
+                chain["layers"]["new_water_by_class"] = {
+                    "path": by_class["outputs"]["output_path"], "mode": "classes", "palette": palette,
+                }
+            summary["success_chain"] = chain
+            summary["rejection_chain"] = not_applicable
+        elif scene:
             summary["success_chain"] = run_extent_chain(
                 args.terrabox_url,
                 api_key,

@@ -136,15 +136,6 @@ export function pickableScenes(scenes: Scene[], showDeveloper: boolean) {
   );
 }
 
-export function sceneFacts(scene: Scene) {
-  return [
-    scene.acquired,
-    scene.sensor,
-    scene.kind_label,
-    scene.area_km2 ? "约 " + scene.area_km2.toFixed(0) + " km²" : null,
-  ].filter(Boolean) as string[];
-}
-
 export function displayTool(slug: string) {
   return slug.split(".").at(-1) ?? slug;
 }
