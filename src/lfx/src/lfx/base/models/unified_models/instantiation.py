@@ -291,6 +291,12 @@ def get_llm(
     }:
         kwargs["use_responses_api"] = True
 
+    # Qwen models on DashScope think before every answer by default (about 10x the latency of an
+    # agent step). TERRAFLOW_QWEN_ENABLE_THINKING=0/1 sets it per deployment; unset keeps the default.
+    qwen_thinking = str(os.environ.get("TERRAFLOW_QWEN_ENABLE_THINKING", "")).strip().lower()
+    if provider == "Qwen" and qwen_thinking in {"0", "false", "no", "off", "1", "true", "yes", "on"}:
+        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "enable_thinking": qwen_thinking in {"1", "true", "yes", "on"}}
+
     try:
         return model_class(**kwargs)
     except Exception as e:
