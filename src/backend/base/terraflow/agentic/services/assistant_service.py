@@ -96,6 +96,26 @@ def _flow_verification_enabled() -> bool:
     return os.getenv(FLOW_VERIFICATION_ENABLED_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+_READ_TOOLS = frozenset({"search_components", "describe_component", "describe_flow_io", "get_field_value"})
+
+
+def _tool_step(name: str) -> str:
+    """Progress step shown while the agent calls tool ``name``."""
+    return "searching_components" if name in _READ_TOOLS else "building_flow"
+
+
+def _tool_message(step: dict) -> str:
+    """One line naming the tool and its main argument, e.g. ``search_components: threshold``."""
+    name = step.get("name") or "tool"
+    tool_input = step.get("input")
+    if isinstance(tool_input, dict):
+        for key in ("query", "component_type", "component_id", "spec", "name"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{name}: {value.strip().splitlines()[0][:80]}"
+    return name
+
+
 async def _verify_flow_before_delivery(
     *,
     flow_filename: str,
@@ -892,9 +912,12 @@ async def execute_flow_with_validation_streaming(
                 ) as flow_generator:
                     try:
                         async for event_type, event_data in flow_generator:
-                            if event_type == "token":
+                            if event_type in ("token", "tool"):
                                 # Drain flow_update events so the canvas reflects
-                                # the agent's incremental edits live. Reconcile
+                                # the agent's incremental edits live (at every
+                                # token and every tool call, so edits made in a
+                                # silent tool-calling stretch are not held back
+                                # until the reply text starts). Reconcile
                                 # build+run deterministically: a `flow_ran` this
                                 # turn forces the built flow onto the canvas.
                                 (
@@ -938,7 +961,15 @@ async def execute_flow_with_validation_streaming(
                                         class_name=comp_event.get("class_name"),
                                         component_code=comp_event.get("component_code"),
                                     )
-                                yield format_token_event(event_data)
+                                if event_type == "token":
+                                    yield format_token_event(event_data)
+                                elif not event_data.get("done"):
+                                    yield format_progress_event(
+                                        _tool_step(event_data.get("name") or ""),
+                                        attempt + 1,
+                                        total_attempts,
+                                        message=_tool_message(event_data),
+                                    )
                             elif event_type == "flow_preview":
                                 has_flow_updates = True
                                 yield format_flow_preview_event(
