@@ -257,6 +257,47 @@ def graph(data: dict[str, Any]) -> dict[str, Any]:
     return {"nodes": out_nodes, "edges": out_edges}
 
 
+def layer_names(data: dict[str, Any]) -> dict[str, str]:
+    """Result-layer names from the wiring: a mask made from the before/after scene is
+    "前期水体掩膜"/"后期水体掩膜", an index raster is named after its index."""
+    nodes = {n.get("id"): n for n in data.get("nodes") or [] if isinstance(n, dict)}
+    inputs = {}
+    for edge in data.get("edges") or []:
+        handles = (edge or {}).get("data") or {}
+        source, target = handles.get("sourceHandle") or {}, handles.get("targetHandle") or {}
+        if source.get("id") and target.get("id"):
+            inputs[(target["id"], target.get("fieldName"))] = (source["id"], source.get("name") or "")
+
+    def value(node_id: str, field: str) -> Any:
+        template = (((nodes.get(node_id) or {}).get("data") or {}).get("node") or {}).get("template") or {}
+        return (template.get(field) or {}).get("value") if isinstance(template.get(field), dict) else None
+
+    def date_of(node_id: str, field: str) -> str | None:
+        link, seen = inputs.get((node_id, field)), set()
+        while link and link[0] not in seen:
+            seen.add(link[0])
+            source_type = ((nodes.get(link[0]) or {}).get("data") or {}).get("type")
+            if source_type == "ToolResultField":
+                link = inputs.get((link[0], "result"))
+                continue
+            if source_type == "WaterInputSet":
+                return {"before_path": "前期", "after_path": "后期"}.get(link[1])
+            if source_type == "SceneInput":
+                scene = str(value(link[0], "scene_id") or "")
+                return "前期" if scene.endswith(".before") else "后期" if scene.endswith(".after") else None
+            return None
+        return None
+
+    names = {}
+    for node_id, node in nodes.items():
+        node_type = (node.get("data") or {}).get("type") or ""
+        if node_type == "TerraboxGeoRasterThresholdSegmentation":
+            names[node_id] = f"{date_of(node_id, 'input_path') or ''}水体掩膜"
+        elif node_type == "TerraboxGeoRasterCalculateIndex":
+            names[node_id] = f"{value(node_id, 'index_name') or '指数'} 栅格"
+    return names
+
+
 def domain_checks(summary: dict[str, Any]) -> list[str]:
     """Scientific problems visible in the flow itself, shown before running and kept on the result."""
     nodes = summary.get("nodes") or []
@@ -444,6 +485,7 @@ class FlowAssistant:
                     outputs = _tool_outputs(built)
                     step = {
                         "chain": "assistant",
+                        "node_id": built.get("id"),
                         "step": len(steps) + 1,
                         "tool_slug": node["type"],
                         "target": node["label"],
@@ -464,7 +506,7 @@ class FlowAssistant:
         except TerraflowError as exc:
             errors.append(str(exc))
         run_id = "af_" + time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-        result = self._result(run_id, flow_id, steps, errors, message)
+        result = self._result(run_id, flow_id, steps, errors, message, layer_names(data))
         result["seconds"] = round(time.monotonic() - started, 1)
         self.run_root.mkdir(parents=True, exist_ok=True)
         (self.run_root / f"{run_id}.json").write_text(json.dumps(
@@ -480,7 +522,7 @@ class FlowAssistant:
         yield "done", {}
 
     def _result(self, run_id: str, flow_id: str, steps: list[dict[str, Any]], errors: list[str],
-                message: dict[str, Any]) -> dict[str, Any]:
+                message: dict[str, Any], names: dict[str, str] | None = None) -> dict[str, Any]:
         outputs = [s["outputs"] for s in steps if isinstance(s.get("outputs"), dict)]
         merged: dict[str, Any] = {}
         for item in outputs:
@@ -509,14 +551,16 @@ class FlowAssistant:
             "label": "Terrabox 检查",
             "description": "网格、标签和面积坐标系由 Terrabox 工具检查；工作流本身由流程助手搭建，未经场景规则校验",
         }
+        names = names or {}
         layer_paths = []
         for step in steps:
             path = (step.get("outputs") or {}).get("output_path") if isinstance(step.get("outputs"), dict) else None
             if path and str(path).endswith((".tif", ".tiff")) and Path(path).is_file():
                 mode = "continuous" if "Index" in step["tool_slug"] else "labels"
-                layer_paths.append({"path": path, "mode": mode, "label": step["target"]})
+                label = names.get(step.get("node_id") or "") or f"{step['target']} 输出"
+                layer_paths.append({"path": path, "mode": mode, "label": label})
         layers = [{
-            "key": f"layer{i}", "label": f"{item['label']} 输出",
+            "key": f"layer{i}", "label": item["label"],
             "url": f"/api/workspace/assistant-runs/{run_id}/preview/{i}",
             "legend": [{"color": "#2570eb", "label": "水体"}, {"color": "#484d57", "label": "非水体"}]
             if item["mode"] == "labels" else [{"color": "linear-gradient(90deg,#000,#fff)", "label": "低 → 高"}],
