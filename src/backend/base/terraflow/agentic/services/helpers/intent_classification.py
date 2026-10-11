@@ -52,6 +52,26 @@ def _looks_like_run_request(text: str) -> bool:
     return bool(_RUN_FLOW_RE.search(message))
 
 
+# An explicit request to build/create a flow. The classifier is the source of truth, but some
+# models intermittently answer ``question`` for such a request (observed with qwen3.8-flash on a
+# Chinese "搭建一个工作流：…" request that the same prompt classifies as build_flow on retry).
+_BUILD_FLOW_RE = re.compile(
+    r"(搭建|构建|创建|新建|生成|做|建)(一|一个|个|条)?[^。！？!?\n]{0,24}(工作流|流程|flow|pipeline)"
+    r"|\b(build|create|make|set\s+up|assemble)\b[^.!?\n]{0,60}\b(flow|workflow|pipeline)s?\b",
+    re.IGNORECASE,
+)
+
+
+# How-to / what-is questions about building flows stay questions.
+_QUESTION_RE = re.compile(r"怎么|如何|怎样|为什么|是什么|什么是|吗\s*[？?]?\s*$|\b(how|what|why|can i|is it)\b", re.IGNORECASE)
+
+
+def _looks_like_build_request(text: str) -> bool:
+    """True when the user's own message clearly asks to build or create a flow (not a how-to question)."""
+    message = text.rsplit("User message:", 1)[-1] if "User message:" in text else text
+    return bool(_BUILD_FLOW_RE.search(message)) and not _QUESTION_RE.search(message)
+
+
 def _with_tokens(result: IntentResult, tokens: dict[str, int] | None) -> IntentResult:
     """Attach the TranslationFlow's token usage to the IntentResult.
 
@@ -97,6 +117,9 @@ def _finalize(
     if intent == "question" and _looks_like_run_request(translation or text):
         logger.info("intent.run_flow: classifier returned question; rescued explicit run request")
         return IntentResult(translation=translation, intent="run_flow", requested_model=rm, requested_provider=rp)
+    if intent == "question" and (_looks_like_build_request(text) or _looks_like_build_request(translation or "")):
+        logger.warning("intent.build_flow: classifier returned question; rescued explicit build request")
+        return IntentResult(translation=translation, intent="build_flow", requested_model=rm, requested_provider=rp)
     return IntentResult(translation=translation, intent=intent, requested_model=rm, requested_provider=rp)
 
 
@@ -238,6 +261,7 @@ async def classify_intent(
                 logger.warning("Intent flow returned non-JSON, treating as question")
                 return _with_tokens(_finalize(response_text, "question", text), translation_tokens)
 
+        logger.warning("intent.classification.empty_response: TranslationFlow returned no text, defaulting to question")
         return _with_tokens(_finalize(text, "question", text), translation_tokens)
     except asyncio.TimeoutError:
         logger.warning(
