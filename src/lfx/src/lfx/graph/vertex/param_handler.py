@@ -342,6 +342,10 @@ class ParameterHandler:
                         params[field_name] = unescape_string(val)
                     case Data():
                         params[field_name] = unescape_string(val.get_text())
+                    case int() | float() if not isinstance(val, bool):
+                        # A number saved into a text field (e.g. by the flow assistant) was
+                        # dropped here, so the component saw its blank default instead.
+                        params[field_name] = str(val)
             case "bool":
                 match val:
                     case bool():

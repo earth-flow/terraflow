@@ -238,3 +238,20 @@ class TestParameterHandlerDictField:
         params = {}
         result = self.handler._handle_dict_field("data", val, params)
         assert result["data"] == {"a": 1, "b": 2}
+
+
+class TestParameterHandlerNumberInTextField:
+    """A number saved into a text field keeps its value (as text) instead of being dropped."""
+
+    def setup_method(self):
+        self.mock_vertex = MagicMock()
+        self.mock_vertex.data = {"node": {"template": {}}}
+        self.handler = ParameterHandler(self.mock_vertex, storage_service=None)
+
+    @pytest.mark.parametrize(("value", "expected"), [(255, "255"), (-14.21875, "-14.21875"), (0, "0"), ("1.5", "1.5")])
+    def test_number_in_str_field_is_kept_as_text(self, value, expected):
+        params = self.handler._handle_other_direct_types("nodata_value", {"type": "str"}, value, {})
+        assert params == {"nodata_value": expected}
+
+    def test_bool_in_str_field_is_still_ignored(self):
+        assert self.handler._handle_other_direct_types("flag", {"type": "str"}, True, {}) == {}
