@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 
+from lfx.base.models.unified_models.instantiation import QWEN_THINKING_OVERRIDE
 from lfx.log.logger import logger
 
 from terraflow.agentic.services.flow_executor import (
@@ -64,6 +65,15 @@ _BUILD_FLOW_RE = re.compile(
 
 # How-to / what-is questions about building flows stay questions.
 _QUESTION_RE = re.compile(r"怎么|如何|怎样|为什么|是什么|什么是|吗\s*[？?]?\s*$|\b(how|what|why|can i|is it)\b", re.IGNORECASE)
+
+
+# The deterministic build path covers Chinese requests only and leaves to the classifier what
+# only it extracts: component_then_flow (a custom component is asked for) and a model the user
+# names (requested_model / requested_provider). English requests keep the upstream behaviour.
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_NEEDS_CLASSIFIER_RE = re.compile(
+    r"component|组件|自定义|custom|模型|model|gpt|qwen|claude|gemini|deepseek|llama", re.IGNORECASE
+)
 
 
 def _looks_like_build_request(text: str) -> bool:
@@ -169,8 +179,18 @@ async def classify_intent(
         logger.info("intent.build_flow.deterministic: plan-approval continuation signal")
         return IntentResult(translation=text, intent="build_flow")
 
+    # Deterministic: an explicit "build a workflow" request (not a how-to question)
+    # is a flow build. Skipping the TranslationFlow saves a full model round-trip
+    # (30 s with a thinking model, which also timed out into "question"). The
+    # Chinese text goes to the flow builder untranslated; it reads it directly.
+    if _CJK_RE.search(text) and _looks_like_build_request(text) and not _NEEDS_CLASSIFIER_RE.search(text):
+        logger.info("intent.build_flow.deterministic: explicit build request")
+        return IntentResult(translation=text, intent="build_flow")
+
     flow_input = f"{context}\n\nUser message: {text}" if context else text
 
+    # The classifier answers with a short JSON label: Qwen's thinking only adds latency.
+    thinking_token = QWEN_THINKING_OVERRIDE.set(False)
     try:
         logger.debug("Classifying intent and translating text")
         result = await asyncio.wait_for(
@@ -272,3 +292,5 @@ async def classify_intent(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Intent classification failed, defaulting to question: {e}")
         return _finalize(text, "question", text)
+    finally:
+        QWEN_THINKING_OVERRIDE.reset(thinking_token)

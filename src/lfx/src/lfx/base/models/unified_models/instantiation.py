@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from lfx.base.models.model_utils import _to_str
@@ -25,6 +26,35 @@ def _env_if_allowed(key: str) -> str | None:
     if is_env_fallback_disabled():
         return None
     return os.environ.get(key)
+
+
+# Per-call override of Qwen thinking (e.g. the intent classifier needs a one-word label, not a
+# chain of thought). None defers to the deployment settings below.
+QWEN_THINKING_OVERRIDE: ContextVar[bool | None] = ContextVar("qwen_thinking_override", default=None)
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def _qwen_thinking_options() -> dict[str, Any]:
+    """DashScope options for Qwen thinking.
+
+    Qwen models on DashScope think before every answer by default (43 s vs 3.4 s on a 9.6k-token
+    prompt). TERRAFLOW_QWEN_ENABLE_THINKING=0/1 sets it per deployment and
+    TERRAFLOW_QWEN_THINKING_BUDGET caps the thinking tokens while it is on; unset keeps the
+    provider default. QWEN_THINKING_OVERRIDE wins for the current call.
+    """
+    override = QWEN_THINKING_OVERRIDE.get()
+    setting = str(os.environ.get("TERRAFLOW_QWEN_ENABLE_THINKING", "")).strip().lower()
+    enabled = override if override is not None else (True if setting in _TRUE else False if setting in _FALSE else None)
+    options: dict[str, Any] = {}
+    if enabled is not None:
+        options["enable_thinking"] = enabled
+    budget = str(os.environ.get("TERRAFLOW_QWEN_THINKING_BUDGET", "")).strip()
+    if enabled is not False and budget.isdigit() and int(budget) > 0:
+        options["enable_thinking"] = True
+        options["thinking_budget"] = int(budget)
+    return options
 
 
 def get_llm(
@@ -291,11 +321,10 @@ def get_llm(
     }:
         kwargs["use_responses_api"] = True
 
-    # Qwen models on DashScope think before every answer by default (about 10x the latency of an
-    # agent step). TERRAFLOW_QWEN_ENABLE_THINKING=0/1 sets it per deployment; unset keeps the default.
-    qwen_thinking = str(os.environ.get("TERRAFLOW_QWEN_ENABLE_THINKING", "")).strip().lower()
-    if provider == "Qwen" and qwen_thinking in {"0", "false", "no", "off", "1", "true", "yes", "on"}:
-        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "enable_thinking": qwen_thinking in {"1", "true", "yes", "on"}}
+    if provider == "Qwen":
+        qwen_extra = _qwen_thinking_options()
+        if qwen_extra:
+            kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), **qwen_extra}
 
     try:
         return model_class(**kwargs)

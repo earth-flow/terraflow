@@ -709,3 +709,33 @@ class TestClassifyIntentTokenUsage:
         # tokens captured AND removed from the dict passed to extract_response_text.
         assert result.tokens == translation_tokens
         assert "_metrics" not in mock_result, "_metrics should be popped by classify_intent"
+
+
+class TestDeterministicChineseBuildRequest:
+    """An explicit Chinese build request skips the TranslationFlow (one model round-trip)."""
+
+    @pytest.mark.asyncio
+    async def test_chinese_build_request_skips_the_llm(self):
+        with patch(
+            "terraflow.agentic.services.helpers.intent_classification.execute_flow_file",
+            new_callable=AsyncMock,
+        ) as mock_execute:
+            result = await classify_intent(
+                text="搭建一个工作流：比较色萨利前后两期 SAR 影像，计算新增水体面积。", global_variables={}
+            )
+        assert result.intent == "build_flow"
+        mock_execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        ["怎么搭建一个工作流？", "先写一个自定义组件，再搭建一个工作流", "用 gpt-5.4 模型搭建一个工作流"],
+    )
+    async def test_questions_components_and_named_models_still_use_the_llm(self, text):
+        with patch(
+            "terraflow.agentic.services.helpers.intent_classification.execute_flow_file",
+            new_callable=AsyncMock,
+            return_value={"result": '{"translation": "x", "intent": "question"}'},
+        ) as mock_execute:
+            await classify_intent(text=text, global_variables={})
+        mock_execute.assert_called_once()
