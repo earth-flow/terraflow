@@ -1130,6 +1130,14 @@ async def execute_flow_with_validation_streaming(
                 # success. Skipped (returns None) when the kill switch is
                 # off / no FLOW_ID / empty canvas → unchanged behavior.
                 if is_flow_request and saw_set_flow:
+                    # The trial run (and any fix turn) can take minutes; say so.
+                    if _flow_verification_enabled():
+                        yield format_progress_event(
+                            "validating",
+                            attempt + 1,
+                            total_attempts,
+                            message="Test-running the flow before delivery",
+                        )
                     verification = await _verify_flow_before_delivery(
                         flow_filename=flow_filename,
                         global_variables=global_variables,
