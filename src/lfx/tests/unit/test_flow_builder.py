@@ -1525,3 +1525,14 @@ edges:
         result = parse_flow_spec(spec)
         assert result["config"]["A"]["input_value"] == "test"
         assert len(result["edges"]) == 1
+
+
+def test_quoted_config_values_are_unquoted_strings():
+    # N041: a model wrote `Seg.background_value: "0"`; the int field could not parse '"0"'.
+    from lfx.graph.flow_builder.spec import parse_flow_spec
+
+    parsed = parse_flow_spec(
+        "name: Q\nnodes:\n  Seg: ThresholdSegmentation\nconfig:\n"
+        '  Seg.background_value: "0"\n  Seg.method: \'otsu\'\n  Seg.nodata_value: 255\n  Seg.note: say "hi"\n'
+    )
+    assert parsed["config"]["Seg"] == {"background_value": "0", "method": "otsu", "nodata_value": 255, "note": 'say "hi"'}

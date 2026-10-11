@@ -39,7 +39,13 @@ _CONFIG_KEY_RE = re.compile(r"^(\w+\.\w+):\s*(.*)$")
 
 
 def _coerce_value(v: str):
-    """Coerce a string value to int, float, bool, or None if applicable."""
+    """Coerce a string value to int, float, bool, or None if applicable.
+
+    A value in matching quotes (``"0"``, ``'text'``) is the quoted string itself;
+    models often quote values, and an int field cannot parse ``'"0"'``.
+    """
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":  # noqa: PLR2004
+        return v[1:-1]
     if v.lower() == "true":
         return True
     if v.lower() == "false":
