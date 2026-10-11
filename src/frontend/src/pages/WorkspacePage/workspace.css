@@ -1259,3 +1259,282 @@
 .ws-left .md\:grid-cols-4 {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
+
+/* ===== N046: interaction motion. Short (120–240 ms), opacity and transform only, off with reduced motion. ===== */
+.ws-app {
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --t-fast: 120ms;
+  --t: 180ms;
+  --t-slow: 240ms;
+}
+@keyframes ws-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+@keyframes ws-in-down {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+@keyframes ws-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes ws-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+@keyframes ws-pop-x {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.9);
+  }
+}
+
+/* Hover and press feedback */
+.ws-app button,
+.ws-app a,
+.ws-app summary,
+.ws-app label {
+  transition:
+    background-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    box-shadow var(--t) var(--ease),
+    opacity var(--t) var(--ease),
+    filter var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
+}
+.ws-primary-btn:hover:not(:disabled),
+.ws-det .btns button.p:hover {
+  filter: brightness(1.07);
+}
+.ws-primary-btn:active:not(:disabled),
+.ws-ghost-btn:active,
+.ws-suggest:active,
+.ws-handoff:active,
+.ws-views button:active,
+.ws-tabs button:active,
+.ws-kits .kit:active,
+.ws-det .btns button:active,
+.ws-catalog .acts button:active,
+.ws-upload:active,
+.ws-headline button:active {
+  transform: scale(0.97);
+}
+.ws-ghost-btn:hover,
+.ws-det .btns button:not(.p):hover {
+  background: #fff;
+  color: var(--ink);
+}
+.ws-suggest:hover {
+  box-shadow: 0 4px 12px -6px rgba(37, 99, 235, 0.35);
+}
+.ws-app .ws-composer {
+  transition: box-shadow var(--t) var(--ease);
+}
+.ws-app .ws-composer:focus-within {
+  box-shadow:
+    0 0 0 3px rgba(37, 99, 235, 0.14),
+    0 4px 14px -6px rgba(15, 23, 42, 0.18);
+}
+.ws-search {
+  transition: box-shadow var(--t) var(--ease);
+}
+.ws-search:focus {
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+}
+
+/* Segmented switches: one white pill slides to the chosen option (--i of --n). */
+.ws-views,
+.ws-tabs {
+  position: relative;
+  isolation: isolate;
+}
+.ws-views::before,
+.ws-tabs::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px - (var(--n, 1) - 1) * 2px) / var(--n, 1));
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1);
+  transform: translateX(calc(var(--i, 0) * (100% + 2px)));
+  transition:
+    transform var(--t-slow) var(--ease),
+    opacity var(--t) var(--ease);
+}
+.ws-tabs::before {
+  border-radius: 7px;
+}
+.ws-views:not(.has-on)::before {
+  opacity: 0;
+}
+.ws-views button {
+  flex: 1 1 0;
+  min-width: 96px;
+  justify-content: center;
+  white-space: nowrap;
+}
+.ws-views button.on,
+.ws-tabs button.on {
+  background: transparent;
+  box-shadow: none;
+}
+.ws-views button:not(.on):hover,
+.ws-tabs button:not(.on):hover {
+  color: var(--ink);
+}
+.ws-views svg {
+  transition: color var(--t) var(--ease);
+}
+
+/* View switch and panel contents */
+.ws-main > .ws-view {
+  animation: ws-in var(--t-slow) var(--ease) both;
+}
+.ws-side > .ws-catalog,
+.ws-side > .ws-layers,
+.ws-side > .ws-det,
+.ws-tlist {
+  animation: ws-fade var(--t) var(--ease) both;
+}
+
+/* Chat: new messages, live steps, the data picker, attachments */
+.ws-msgs > * {
+  animation: ws-in var(--t-slow) var(--ease) both;
+}
+.ws-steps > li {
+  animation: ws-in-down var(--t) var(--ease) both;
+}
+.ws-picker {
+  animation: ws-in var(--t) var(--ease) both;
+}
+.ws-app .ws-chip {
+  animation: ws-pop var(--t) var(--ease) both;
+}
+
+/* Data view */
+.ws-aoi img {
+  animation: ws-fade var(--t-slow) var(--ease) both;
+}
+.ws-headline,
+.ws-obs {
+  animation: ws-in-down var(--t) var(--ease) both;
+}
+.ws-obs {
+  animation-name: ws-in;
+}
+.ws-obs .mk {
+  transition:
+    transform var(--t-fast) var(--ease),
+    background-color var(--t) var(--ease);
+}
+.ws-obs .o:hover .mk:not(.s2) {
+  transform: scale(1.25);
+}
+.ws-obs .o:hover .mk.s2 {
+  transform: rotate(45deg) scale(1.05);
+}
+.ws-obs .o em {
+  animation: ws-pop-x var(--t) var(--ease) both;
+}
+.ws-split i {
+  transition: transform var(--t-fast) var(--ease);
+}
+.ws-split:hover i,
+.ws-split:active i {
+  transform: scale(1.08);
+}
+.ws-catalog summary {
+  justify-content: flex-start;
+  align-items: center;
+  gap: 7px;
+}
+.ws-catalog summary::-webkit-details-marker {
+  display: none;
+}
+.ws-catalog summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--ink-3);
+  border-bottom: 1.5px solid var(--ink-3);
+  transform: rotate(-45deg);
+  transition: transform var(--t) var(--ease);
+  flex-shrink: 0;
+}
+.ws-catalog details[open] > summary::before {
+  transform: rotate(45deg);
+}
+.ws-catalog summary span {
+  margin-left: auto;
+}
+.ws-catalog details[open] > .row {
+  animation: ws-in-down var(--t) var(--ease) both;
+}
+.ws-catalog .row {
+  transition:
+    background-color var(--t) var(--ease),
+    box-shadow var(--t) var(--ease);
+}
+.ws-catalog .row:not(.sel):hover,
+.ws-layers .ly:hover,
+.ws-det .lib button:hover {
+  background: rgba(255, 255, 255, 0.6);
+}
+.ws-catalog .acts {
+  animation: ws-in-down var(--t) var(--ease) both;
+}
+
+/* Tools view */
+.ws-kits .kit:not(.sel):hover {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(37, 99, 235, 0.25);
+}
+.ws-tlist .trow:not(.sel):hover {
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 8px;
+}
+
+/* Workflow view: nodes, edges and log lines appear as the flow is built */
+.ws-node {
+  animation: ws-pop var(--t-slow) var(--ease) both;
+}
+.ws-node:not(.is-sel):hover {
+  box-shadow: 0 10px 22px -10px rgba(15, 23, 42, 0.45);
+}
+.ws-edges path,
+.ws-elab {
+  animation: ws-fade var(--t-slow) var(--ease) both;
+}
+.ws-edges path {
+  transition: stroke var(--t) var(--ease);
+}
+.ws-building li.now {
+  animation: ws-in var(--t) var(--ease) both;
+}
+.ws-runbar,
+.ws-fbar {
+  animation: ws-in var(--t) var(--ease) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-app *,
+  .ws-app *::before,
+  .ws-app *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

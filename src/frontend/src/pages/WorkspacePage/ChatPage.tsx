@@ -71,7 +71,7 @@ function Warnings({ items }: { items?: string[] }) {
 function StepList({ steps }: { steps: StepEvent[] }) {
   if (!steps.length) return null;
   return (
-    <ol className="mt-3 space-y-1">
+    <ol className="ws-steps mt-3 space-y-1">
       {steps.map((step) => (
         <li
           key={step.id ?? step.tool + step.target}
@@ -854,7 +854,7 @@ export default function ChatPage() {
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
-        <div className="flex w-full flex-col gap-4">
+        <div className="ws-msgs flex w-full flex-col gap-4">
           {messages.length === 0 && !draft && (
             <div className="pt-1">
               <p className="text-sm leading-6 text-muted-foreground">
@@ -925,7 +925,7 @@ export default function ChatPage() {
       </div>
       <div className="px-3 pb-3">
         {picker && (
-          <div className="mb-2 max-h-80 overflow-y-auto rounded-2xl border border-border bg-card p-3">
+          <div className="ws-picker mb-2 max-h-80 overflow-y-auto rounded-2xl border border-border bg-card p-3">
             <p className="mb-2 text-xs text-muted-foreground">
               选择要分析的数据（最多 {MAX_ATTACHMENTS}{" "}
               份），也可以在“数据”视图中选中后点“用于提问”。

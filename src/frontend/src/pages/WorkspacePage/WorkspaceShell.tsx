@@ -50,7 +50,19 @@ export default function WorkspaceShell() {
           <TerraflowLogo className="h-5 w-5" />
           <span>Agent Workspace</span>
         </button>
-        <nav aria-label="视图" className="ws-views">
+        <nav
+          aria-label="视图"
+          className={"ws-views" + (onMain ? " has-on" : "")}
+          style={
+            {
+              "--n": VIEWS.length,
+              "--i": Math.max(
+                0,
+                VIEWS.findIndex((v) => v.id === view),
+              ),
+            } as React.CSSProperties
+          }
+        >
           {VIEWS.map((v) => (
             <button
               type="button"

@@ -52,7 +52,7 @@ function Stage({
   const stack = (list: Layer[]) =>
     [...list.filter((l) => !isMask(l)), ...list.filter(isMask)].map((l) => (
       <img
-        key={l.key}
+        key={l.key + "|" + l.url}
         src={l.url}
         alt={l.label}
         className={isMask(l) && list.some((x) => !isMask(x)) ? "ws-mask" : ""}
@@ -292,7 +292,15 @@ export default function DataStage() {
         )}
       </section>
       <aside className="ws-side">
-        <div className="ws-tabs">
+        <div
+          className="ws-tabs"
+          style={
+            {
+              "--n": 2,
+              "--i": tab === "catalog" ? 0 : 1,
+            } as React.CSSProperties
+          }
+        >
           <button
             type="button"
             className={tab === "catalog" ? "on" : ""}

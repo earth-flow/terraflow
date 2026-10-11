@@ -459,7 +459,7 @@ export default function FlowView() {
             <ol>
               {(draft.log ?? [draft.status]).map((line, i, all) => (
                 <li
-                  key={line + i}
+                  key={line.replace(/….*$/, "") + i}
                   className={i === all.length - 1 ? "now" : ""}
                 >
                   {line}
@@ -514,7 +514,7 @@ export default function FlowView() {
       </section>
       <aside className="ws-side">
         {chosen ? (
-          <div className="ws-det">
+          <div className="ws-det" key={chosen.id}>
             <p className="dh">{chosen.label}</p>
             <code>{chosen.type}</code>
             {Object.keys(chosen.params).length > 0 && (

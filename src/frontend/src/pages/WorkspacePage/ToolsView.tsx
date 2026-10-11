@@ -127,7 +127,7 @@ export default function ToolsView() {
             ))}
           </div>
         )}
-        <div className="ws-tlist">
+        <div className="ws-tlist" key={q ? "search" : kit}>
           <p className="hd2">
             {q ? `搜索“${query}”` : `${TOOLKIT_CN[kit] ?? kit}（${kit}）`}
             <span>{list.length} 个工具</span>
@@ -159,7 +159,7 @@ export default function ToolsView() {
       </section>
       <aside className="ws-side">
         {tool ? (
-          <div className="ws-det">
+          <div className="ws-det" key={tool.slug}>
             <p className="dh">
               {toolName(tool.slug) !== tool.slug.split(".").at(-1)
                 ? toolName(tool.slug)
