@@ -234,11 +234,13 @@ def get_llm(
         )
         if ollama_base_url_value:
             kwargs[base_url_param] = ollama_base_url_value
-    elif provider in {"OpenRouter", "DeepSeek", "Qwen"}:
+    elif provider in {"OpenAI", "OpenRouter", "DeepSeek", "Qwen"}:
         # These providers all speak the OpenAI wire format. Point ChatOpenAI at
         # the provider's base URL (declared in MODEL_PROVIDER_METADATA) and
         # forward any configured attribution headers (OpenRouter's HTTP-Referer
-        # / X-Title) so usage shows up correctly in its dashboard.
+        # / X-Title) so usage shows up correctly in its dashboard. OpenAI has no
+        # declared base URL; a configured OPENAI_API_BASE (e.g. a gateway) is
+        # applied here, otherwise the client default (api.openai.com) is kept.
         provider_meta = model_provider_metadata.get(provider, {})
         provider_vars = unified_models_module.get_all_variables_for_provider(user_id, provider)
 
@@ -278,6 +280,16 @@ def get_llm(
                 default_headers[header_name] = value
         if default_headers:
             kwargs["default_headers"] = default_headers
+
+    # Some OpenAI-compatible gateways (e.g. a Codex relay) only route the Responses API, not
+    # Chat Completions. Opt in per deployment; unset keeps the default Chat Completions path.
+    if provider == "OpenAI" and str(os.environ.get("TERRAFLOW_OPENAI_USE_RESPONSES_API", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        kwargs["use_responses_api"] = True
 
     try:
         return model_class(**kwargs)
