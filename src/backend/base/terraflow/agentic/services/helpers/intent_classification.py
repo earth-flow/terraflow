@@ -55,16 +55,19 @@ def _looks_like_run_request(text: str) -> bool:
 
 # An explicit request to build/create a flow. The classifier is the source of truth, but some
 # models intermittently answer ``question`` for such a request (observed with qwen3.8-flash on a
-# Chinese "搭建一个工作流：…" request that the same prompt classifies as build_flow on retry).
+# Chinese "搭建一个工作流：…" request that the same prompt classifies as build_flow on retry).  # noqa: RUF003
 _BUILD_FLOW_RE = re.compile(
-    r"(搭建|构建|创建|新建|生成|做|建)(一|一个|个|条)?[^。！？!?\n]{0,24}(工作流|流程|flow|pipeline)"
+    r"(搭建|构建|创建|新建|生成|做|建)(一|一个|个|条)?[^。！？!?\n]{0,24}(工作流|流程|flow|pipeline)"  # noqa: RUF001
     r"|\b(build|create|make|set\s+up|assemble)\b[^.!?\n]{0,60}\b(flow|workflow|pipeline)s?\b",
     re.IGNORECASE,
 )
 
 
 # How-to / what-is questions about building flows stay questions.
-_QUESTION_RE = re.compile(r"怎么|如何|怎样|为什么|是什么|什么是|吗\s*[？?]?\s*$|\b(how|what|why|can i|is it)\b", re.IGNORECASE)
+_QUESTION_RE = re.compile(
+    r"怎么|如何|怎样|为什么|是什么|什么是|吗\s*[？?]?\s*$|\b(how|what|why|can i|is it)\b",  # noqa: RUF001
+    re.IGNORECASE,
+)
 
 
 # The deterministic build path covers Chinese requests only and leaves to the classifier what

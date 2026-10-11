@@ -76,6 +76,7 @@ from terraflow.agentic.services.flow_types import (
     FlowExecutionError,
 )
 from terraflow.agentic.services.flow_verification import FlowVerificationStatus, verify_built_flow
+from terraflow.agentic.services.geo_wiring import geo_wiring_errors
 from terraflow.agentic.services.helpers.intent_classification import _looks_like_run_request, classify_intent
 from terraflow.agentic.services.helpers.intent_context import build_intent_context
 from terraflow.agentic.services.provider_service import get_provider_model_candidates
@@ -121,6 +122,10 @@ async def _verify_flow_before_delivery(
         return None
 
     async def _run(flow: dict) -> dict:
+        # A mis-wired water flow runs without raising; catch it before the run.
+        wiring = geo_wiring_errors(flow)
+        if wiring:
+            return {"error": "Geo wiring error: " + " ".join(wiring)}
         return await run_working_flow(flow_data=flow, flow_id=flow_id, user_id=user_id)
 
     async def _fix(error: str) -> dict | None:

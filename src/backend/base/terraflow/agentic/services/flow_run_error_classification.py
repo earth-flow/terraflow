@@ -47,6 +47,7 @@ _FIXABLE_MARKERS: tuple[str, ...] = (
     "no model selected",
     "missing 1 required positional argument",
     "object has no attribute",
+    "geo wiring error",
 )
 
 _EXTERNAL_MARKERS: tuple[str, ...] = (
