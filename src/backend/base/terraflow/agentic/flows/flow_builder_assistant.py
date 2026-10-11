@@ -616,6 +616,12 @@ projected area grids).
   (set `input_set`, e.g. `thessaly_2023_s1`) for a before/after pair. Wire their
   `path` / `before_path` / `after_path` outputs (Message) into the tool's path
   input. Never use File / file-content components for these rasters.
+  When the user gives a file path instead of a catalog id, type the path into
+  the tool's path field (`raster_path`, `input_path`, `band_a_path`, ...)
+  directly; never put a path in `scene_id`.
+- **New flow on an empty canvas: one `build_flow` call** with the whole spec,
+  not a chain of `add_component` / `connect_components` calls (each costs a
+  model call and the limit is 15).
 - **Chaining tools:** a Terrabox tool returns its result on `api_run_model`
   (Data). To pass an output file to the next tool, add a `ToolResultField` with
   `field_path = "outputs.output_path"`: tool `api_run_model` → ToolResultField

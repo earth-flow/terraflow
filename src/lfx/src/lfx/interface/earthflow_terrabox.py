@@ -328,6 +328,14 @@ def _input_call(field_name: str, input_name: str, field_schema: dict[str, Any], 
         return f"DropdownInput(**{kwargs!r})"
 
     schema_type = _schema_type(field_schema)
+    if schema_type in {"number", "integer"} and not required and default is None:
+        # A FloatInput/IntInput turns a blank field into 0, which the tool would
+        # receive as a real value (e.g. scale_factor=0 zeroes every band). A text
+        # field keeps "blank" distinct, so the argument is omitted and the tool's
+        # own default applies; _coerce_value converts the text to a number.
+        hint = "Leave blank to use the tool's default."
+        kwargs = {**base_kwargs, "info": f"{info} {hint}".strip(), "input_types": ["Message"]}
+        return f"MessageTextInput(**{kwargs!r})"
     if schema_type == "number":
         kwargs = dict(base_kwargs)
         if default is not None:
@@ -476,6 +484,15 @@ class {class_name}(LCToolComponent):
             return None
         schema = self._TERRABOX_PARAMETERS.get("properties", {{}}).get(field_name, {{}})
         schema_type = self._schema_type(schema)
+        if schema_type in {{"number", "integer"}} and isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                number = float(stripped)
+            except ValueError:
+                return value
+            return int(number) if schema_type == "integer" and number.is_integer() else number
         if schema_type in {{"array", "object", "json_or_string"}} and isinstance(value, str):
             stripped = value.strip()
             if not stripped:

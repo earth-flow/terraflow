@@ -527,3 +527,41 @@ def test_refresh_terrabox_components_cache_merges_new_and_drops_stale_toolkit_ca
     assert "earth_sci" not in component_cache.all_types_dict
     # ...while an unrelated native category is left untouched.
     assert "ChatInput" in component_cache.all_types_dict["input_output"]
+
+
+async def test_optional_numeric_field_without_default_is_omitted_when_blank(monkeypatch):
+    # FloatInput turns a blank field into 0.0; an optional number without a schema
+    # default must stay blank (omitted) so the tool's own default applies.
+    spec = TerraboxToolSpec(
+        slug="geo_raster.calculate_index",
+        name="Calculate Index",
+        description="Normalized difference of two bands.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "band_a_path": {"type": "string"},
+                "scale_factor": {"type": "number", "description": "Optional scaling factor (default: 1.0)."},
+                "bins": {"type": "integer"},
+                "gain": {"type": "number", "default": 2.0},
+            },
+            "required": ["band_a_path"],
+        },
+    )
+    template = build_terrabox_component_template(spec)
+    assert template["template"]["scale_factor"]["_input_type"] == "MessageTextInput"
+    assert template["template"]["bins"]["_input_type"] == "MessageTextInput"
+    assert template["template"]["gain"]["_input_type"] == "FloatInput"
+
+    _, instance = create_component_template(
+        component={"code": template["template"]["code"]["value"], "output_types": []},
+    )
+    instance.base_url = "http://terrabox.local"
+    instance.api_key = "test-key"
+    instance.timeout = 7
+    instance.band_a_path = "/data/green.tif"
+    instance.scale_factor = ""
+    instance.bins = " 12 "
+    instance.gain = 2.0
+    assert instance._collect_inputs() == {"band_a_path": "/data/green.tif", "bins": 12, "gain": 2.0}
+    instance.scale_factor = "0.0001"
+    assert instance._collect_inputs()["scale_factor"] == 0.0001
