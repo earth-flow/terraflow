@@ -251,6 +251,8 @@ export default function FlowView() {
     live,
   );
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  // "graph": the workspace's read-only node graph; "canvas": Terraflow's own editable canvas.
+  const [mode, setMode] = useState<"graph" | "canvas">("graph");
   useEffect(() => {
     void apiJson<{ scenarios: Scenario[] }>(API + "/scenarios")
       .then((body) => setScenarios(body.scenarios))
@@ -317,6 +319,11 @@ export default function FlowView() {
     else if (source.status === "pending" || !source.status)
       actions.execute?.(source.id);
   }
+  // The Terraflow flow behind the current workflow: the assistant's flow (templates get one when opened on the canvas).
+  const editableId = source?.kind === "flow" ? source.flow_id : undefined;
+  const canvasOn = mode === "canvas" && Boolean(editableId) && !building;
+  // Reload the embedded canvas whenever the assistant has changed the flow.
+  const canvasKey = (source?.id ?? "") + ":" + messages.length;
   const canRun =
     source &&
     !building &&
@@ -337,15 +344,23 @@ export default function FlowView() {
             source.checks?.length === 0 &&
             !building && <span className="ws-src-tpl">接线检查通过</span>}
           <div className="ml-auto flex shrink-0 items-center gap-1.5">
-            {source?.kind === "flow" && source.flow_id && (
-              <a
-                className="ws-ghost-btn rounded-lg px-2.5 py-1 text-xs"
-                href={"/flow/" + source.flow_id}
-                target="_blank"
-                rel="noreferrer"
-              >
-                在画布中编辑
-              </a>
+            {editableId && !building && (
+              <div className="ws-seg">
+                <button
+                  type="button"
+                  className={mode === "graph" ? "on" : ""}
+                  onClick={() => setMode("graph")}
+                >
+                  节点图
+                </button>
+                <button
+                  type="button"
+                  className={mode === "canvas" ? "on" : ""}
+                  onClick={() => setMode("canvas")}
+                >
+                  画布编辑
+                </button>
+              </div>
             )}
             <button
               type="button"
@@ -357,7 +372,19 @@ export default function FlowView() {
             </button>
           </div>
         </div>
-        {viewNodes.length ? (
+        {canvasOn ? (
+          <div className="ws-native">
+            <iframe
+              key={canvasKey}
+              title="Terraflow 画布"
+              src={"/flow/" + editableId}
+            />
+            <p className="ws-native-note">
+              这是 Terraflow 原生画布，修改会自动保存；回到“节点图”或点“▶
+              运行”都使用保存后的工作流，之后让助手修改也在此基础上进行。
+            </p>
+          </div>
+        ) : viewNodes.length ? (
           <div className="ws-graph" style={{ width, height }}>
             <svg className="ws-edges" width={width} height={height}>
               {edges.map((e) => {
@@ -476,7 +503,7 @@ export default function FlowView() {
             </p>
           </div>
         )}
-        {(building || running || run) && (
+        {!canvasOn && (building || running || run) && (
           <div className="ws-runbar">
             {building || running ? (
               <>
@@ -512,139 +539,141 @@ export default function FlowView() {
           </div>
         )}
       </section>
-      <aside className="ws-side">
-        {chosen ? (
-          <div className="ws-det" key={chosen.id}>
-            <p className="dh">{chosen.label}</p>
-            <code>{chosen.type}</code>
-            {Object.keys(chosen.params).length > 0 && (
-              <>
-                <p className="sec">参数</p>
-                <div className="kvs">
-                  {Object.entries(chosen.params).map(([k, v]) => (
-                    <div key={k}>
-                      {PARAM_CN[k] ?? k}
-                      <b title={String(v)}>{short(v)}</b>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-            {edges.some((e) => e.target === chosen.id) && (
-              <>
-                <p className="sec">输入来自</p>
-                <div className="kvs">
-                  {edges
-                    .filter((e) => e.target === chosen.id)
-                    .map((e) => (
-                      <div key={e.source + (e.label ?? "")}>
-                        {viewNodes.find((n) => n.id === e.source)?.label}
-                        <b>{e.label ?? "结果"}</b>
+      {!canvasOn && (
+        <aside className="ws-side">
+          {chosen ? (
+            <div className="ws-det" key={chosen.id}>
+              <p className="dh">{chosen.label}</p>
+              <code>{chosen.type}</code>
+              {Object.keys(chosen.params).length > 0 && (
+                <>
+                  <p className="sec">参数</p>
+                  <div className="kvs">
+                    {Object.entries(chosen.params).map(([k, v]) => (
+                      <div key={k}>
+                        {PARAM_CN[k] ?? k}
+                        <b title={String(v)}>{short(v)}</b>
                       </div>
                     ))}
-                </div>
-              </>
-            )}
-            {chosen.outputs && (
-              <>
-                <p className="sec">本次运行</p>
-                <div className="kvs">
-                  {Object.entries(chosen.outputs)
-                    .filter(
-                      ([, v]) =>
-                        typeof v === "number" ||
-                        typeof v === "string" ||
-                        typeof v === "boolean",
-                    )
-                    .slice(0, 10)
-                    .map(([k, v]) => (
-                      <div key={k}>
-                        {k}
-                        <b title={String(v)}>
-                          {typeof v === "number"
-                            ? Number(v.toFixed(4))
-                            : short(v)}
+                  </div>
+                </>
+              )}
+              {edges.some((e) => e.target === chosen.id) && (
+                <>
+                  <p className="sec">输入来自</p>
+                  <div className="kvs">
+                    {edges
+                      .filter((e) => e.target === chosen.id)
+                      .map((e) => (
+                        <div key={e.source + (e.label ?? "")}>
+                          {viewNodes.find((n) => n.id === e.source)?.label}
+                          <b>{e.label ?? "结果"}</b>
+                        </div>
+                      ))}
+                  </div>
+                </>
+              )}
+              {chosen.outputs && (
+                <>
+                  <p className="sec">本次运行</p>
+                  <div className="kvs">
+                    {Object.entries(chosen.outputs)
+                      .filter(
+                        ([, v]) =>
+                          typeof v === "number" ||
+                          typeof v === "string" ||
+                          typeof v === "boolean",
+                      )
+                      .slice(0, 10)
+                      .map(([k, v]) => (
+                        <div key={k}>
+                          {k}
+                          <b title={String(v)}>
+                            {typeof v === "number"
+                              ? Number(v.toFixed(4))
+                              : short(v)}
+                          </b>
+                        </div>
+                      ))}
+                  </div>
+                </>
+              )}
+              <div className="btns">
+                <button type="button" onClick={() => selectNode(null)}>
+                  返回
+                </button>
+                {fromAssistant && (
+                  <button
+                    type="button"
+                    onClick={() => requestPrefill(`把“${chosen.label}”的`)}
+                  >
+                    让助手修改
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="ws-det">
+              <p className="dh">工作流</p>
+              {source || building ? (
+                <>
+                  <p className="sec">来源</p>
+                  <p className="txt">
+                    {fromAssistant
+                      ? `流程助手搭建（${source?.model ?? "qwen3.8-flash"}）。不是已验证模板，运行前做接线检查和试运行；结果只经过 Terrabox 工具自身的检查。`
+                      : "已验证模板：按场景规则选择数据和工具顺序，执行时经过科学门控和场景规则校验。"}
+                  </p>
+                  {source?.kind === "flow" && (
+                    <div className="kvs">
+                      <div>
+                        节点<b>{viewNodes.length}</b>
+                      </div>
+                      <div>
+                        搭建用时<b>{source.seconds ?? "—"} s</b>
+                      </div>
+                      <div>
+                        自写组件
+                        <b>
+                          {source.custom_components?.length
+                            ? source.custom_components.join("、")
+                            : "无"}
                         </b>
                       </div>
-                    ))}
-                </div>
-              </>
-            )}
-            <div className="btns">
-              <button type="button" onClick={() => selectNode(null)}>
-                返回
-              </button>
-              {fromAssistant && (
-                <button
-                  type="button"
-                  onClick={() => requestPrefill(`把“${chosen.label}”的`)}
-                >
-                  让助手修改
-                </button>
-              )}
-            </div>
-          </div>
-        ) : (
-          <div className="ws-det">
-            <p className="dh">工作流</p>
-            {source || building ? (
-              <>
-                <p className="sec">来源</p>
-                <p className="txt">
-                  {fromAssistant
-                    ? `流程助手搭建（${source?.model ?? "qwen3.8-flash"}）。不是已验证模板，运行前做接线检查和试运行；结果只经过 Terrabox 工具自身的检查。`
-                    : "已验证模板：按场景规则选择数据和工具顺序，执行时经过科学门控和场景规则校验。"}
-                </p>
-                {source?.kind === "flow" && (
-                  <div className="kvs">
-                    <div>
-                      节点<b>{viewNodes.length}</b>
                     </div>
-                    <div>
-                      搭建用时<b>{source.seconds ?? "—"} s</b>
-                    </div>
-                    <div>
-                      自写组件
-                      <b>
-                        {source.custom_components?.length
-                          ? source.custom_components.join("、")
-                          : "无"}
-                      </b>
-                    </div>
-                  </div>
-                )}
-                {source?.checks?.map((note) => (
-                  <p
-                    key={note}
-                    className="ws-warning mt-2 rounded-lg px-2 py-1 text-xs"
-                  >
-                    运行前检查：{note}
+                  )}
+                  {source?.checks?.map((note) => (
+                    <p
+                      key={note}
+                      className="ws-warning mt-2 rounded-lg px-2 py-1 text-xs"
+                    >
+                      运行前检查：{note}
+                    </p>
+                  ))}
+                  <p className="txt mt-2 text-muted-foreground">
+                    点击节点查看参数和运行数值。
                   </p>
+                </>
+              ) : (
+                <p className="txt">当前对话还没有工作流。</p>
+              )}
+              <p className="sec">已验证模板</p>
+              <div className="lib">
+                {scenarios.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => requestPrefill(s.examples[0] ?? s.title)}
+                    title={s.summary}
+                  >
+                    <span className="ws-src-tpl">模板</span>
+                    {s.title}
+                  </button>
                 ))}
-                <p className="txt mt-2 text-muted-foreground">
-                  点击节点查看参数和运行数值。
-                </p>
-              </>
-            ) : (
-              <p className="txt">当前对话还没有工作流。</p>
-            )}
-            <p className="sec">已验证模板</p>
-            <div className="lib">
-              {scenarios.map((s) => (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => requestPrefill(s.examples[0] ?? s.title)}
-                  title={s.summary}
-                >
-                  <span className="ws-src-tpl">模板</span>
-                  {s.title}
-                </button>
-              ))}
+              </div>
             </div>
-          </div>
-        )}
-      </aside>
+          )}
+        </aside>
+      )}
     </div>
   );
 }

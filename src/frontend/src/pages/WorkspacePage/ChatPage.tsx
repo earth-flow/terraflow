@@ -826,13 +826,13 @@ export default function ChatPage() {
 
   const examples = scenarios
     .flatMap((scenario) =>
-      scenario.examples.slice(0, 1).map((example) => [example, "已验证场景"]),
+      scenario.examples.slice(0, 1).map((example) => [example, "已验证模板"]),
     )
     .slice(0, 3)
     .concat([
       [
-        "搭建一个工作流：用 Sentinel-2 计算色萨利 9 月 10 日的 NDWI，阈值 0 提取水体并计算面积",
-        "流程助手",
+        "帮我搭建一个工作流：用 9 月 10 日的 Sentinel-2 影像计算 NDWI，以 0 为阈值提取色萨利的水体，再计算水面面积。",
+        "流程助手搭建",
       ],
     ]);
 
@@ -881,11 +881,11 @@ export default function ChatPage() {
           {messages.length === 0 && !draft && (
             <div className="pt-1">
               <p className="text-sm leading-6 text-muted-foreground">
-                选好地点或数据后直接提问。
-                <b className="text-foreground">已验证的场景</b>
-                按模板生成工作流并经过科学门控；
+                可以直接提问，也可以先在右侧选好数据。常见的分析会套用
+                <b className="text-foreground">已验证的模板</b>
+                ，并经过科学检查；需要
                 <b className="text-foreground">搭建或修改工作流</b>
-                交给流程助手。两种都会出现在“工作流”视图里，运行结果回到“数据”视图。
+                时，由流程助手完成。工作流显示在“工作流”视图，运行结果显示在“数据”视图。
               </p>
               <div className="mt-3 grid gap-2">
                 {examples.map(([example, source]) => (

@@ -506,8 +506,8 @@ TASK_SCENARIOS: dict[str, dict[str, Any]] = {
             "差异不能单独证明洪水成因",
         ],
         "examples": [
-            "看看希腊色萨利 2023 年 9 月那次洪水，新增了多少水面？",
-            "比较这两期影像的水体变化，并给出证据。",
+            "2023 年 9 月希腊色萨利发生洪水，洪水后比洪水前多了多少水面？",
+            "对比这两期影像，水面有什么变化？请给出依据。",
         ],
         "build_result": water_change_result,
     },
@@ -535,8 +535,8 @@ TASK_SCENARIOS: dict[str, dict[str, Any]] = {
             "单景不能说明变化或淹没",
         ],
         "examples": [
-            "色萨利 9 月 13 日那景影像里有多少水面？",
-            "提取这景影像的水体范围。",
+            "色萨利 2023 年 9 月 13 日的雷达影像上，水面有多大？",
+            "提取这景影像中的水体范围。",
         ],
         "build_result": water_extent_result,
     },
@@ -554,7 +554,7 @@ TASK_SCENARIOS["optical_water"] = {
     "tools": ["raster_viewer.inspect_geotiff", "geo_water.raster_profile_preflight", "geo_raster.calculate_index",
               "geo_raster.apply_cloud_mask", "geo_raster.threshold_segmentation", "geo_water.water_extent"],
     "limitations": ["NDWI 固定阈值是经验规则，浑浊水和阴影可能误判", "受云影响；只反映成像时刻"],
-    "examples": ["用 9 月 10 日的 Sentinel-2 看看色萨利有多少水面？", "用光学影像提取色萨利的水体。"],
+    "examples": ["用 9 月 10 日的 Sentinel-2 光学影像，估算色萨利的水面面积。", "用光学影像提取色萨利的水体。"],
     "build_result": optical_water_result,
 }
 TASK_SCENARIOS["landcover_impact"] = {
@@ -573,7 +573,7 @@ TASK_SCENARIOS["landcover_impact"] = {
     "tools": ["raster_viewer.inspect_geotiff", "geo_water.raster_profile_preflight", "geo_raster.threshold_segmentation",
               "geo_water.water_evidence", "geo_water.water_by_class"],
     "limitations": ["SAR 水体为阈值估计", "土地覆盖是分类产品，年份可能与洪水不同"],
-    "examples": ["色萨利这次洪水淹了多少耕地？", "新增水体里各类土地覆盖分别有多少？"],
+    "examples": ["这次色萨利洪水淹没了多少耕地？", "新增的水面分别落在哪些土地覆盖类型上？"],
     "build_result": landcover_impact_result,
 }
 TASK_SCENARIOS["reference_compare"] = {
@@ -590,7 +590,7 @@ TASK_SCENARIOS["reference_compare"] = {
     "tools": ["raster_viewer.inspect_geotiff", "geo_raster.threshold_segmentation", "geo_water.water_extent",
               "geo_water.compare_with_reference"],
     "limitations": ["参考范围是制图产品，不是真值", "影像与参考日期不同时差异不全是误差"],
-    "examples": ["色萨利的识别结果和 EMS 洪水范围差多少？", "把这景影像的水体和参考范围对比一下。"],
+    "examples": ["我们识别出的色萨利水体，和 Copernicus EMS 发布的洪水范围相差多少？", "把这景影像的水体和参考范围对比一下。"],
     "build_result": reference_compare_result,
 }
 
