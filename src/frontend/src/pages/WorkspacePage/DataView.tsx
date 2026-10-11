@@ -24,6 +24,17 @@ const isMask = (layer: Layer) =>
 const isBefore = (layer: Layer) => /前期|before/i.test(layer.label + layer.key);
 const isAfter = (layer: Layer) => /后期|after/i.test(layer.label + layer.key);
 
+// An index raster (e.g. NDWI) would cover the true-colour image; it starts hidden when one is present.
+const isIndex = (layer: Layer) => /栅格|NDWI|指数/.test(layer.label);
+function isVisible(
+  layer: Layer,
+  all: Layer[],
+  visible: Record<string, boolean>,
+) {
+  if (visible[layer.key] !== undefined) return visible[layer.key];
+  return !(isIndex(layer) && all.some((l) => !isMask(l) && !isIndex(l)));
+}
+
 function usableItems(items: CatalogItem[]) {
   return items.filter(
     (item) =>
@@ -45,7 +56,7 @@ function Stage({
 }) {
   const [split, setSplit] = useState(50);
   const box = useRef<HTMLDivElement>(null);
-  const shown = layers.filter((l) => visible[l.key] !== false);
+  const shown = layers.filter((l) => isVisible(l, layers, visible));
   const before = shown.filter(isBefore);
   const after = shown.filter(isAfter);
   const swipe = before.length > 0 && after.length > 0;
@@ -382,7 +393,7 @@ export default function DataStage() {
                 </span>
                 <input
                   type="checkbox"
-                  checked={visible[l.key] !== false}
+                  checked={isVisible(l, result.result!.layers, visible)}
                   onChange={(e) => {
                     setShowResult(true);
                     setVisible((v) => ({ ...v, [l.key]: e.target.checked }));

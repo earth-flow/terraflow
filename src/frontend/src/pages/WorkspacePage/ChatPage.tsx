@@ -50,6 +50,8 @@ const TARGET_LABELS: Record<string, string> = {
   scene: "本景",
 };
 const MAX_ATTACHMENTS = 4;
+// Terraflow's flow assistant treats this exact text as approval of its proposed plan.
+const PLAN_APPROVAL = "User approved the plan. Proceed with the build.";
 
 function Markdown({ text }: { text: string }) {
   return (
@@ -346,6 +348,7 @@ function MessageView({
   onCancel,
   onRunFlow,
   onHandoff,
+  onApprove,
 }: {
   message: ChatMessage;
   live?: Live;
@@ -359,6 +362,7 @@ function MessageView({
   onCancel: (id: string) => void;
   onRunFlow: (id: string) => void;
   onHandoff?: () => void;
+  onApprove?: () => void;
 }) {
   if (message.role === "user") {
     return (
@@ -430,6 +434,25 @@ function MessageView({
   }
   return (
     <div className="max-w-[95%]">
+      {message.proposal && (
+        <div className="ws-plan mb-2 rounded-2xl border p-3">
+          <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+            <span className="ws-src-ai rounded px-1.5">流程助手</span>
+            搭建计划，确认后开始搭建
+          </p>
+          <Markdown text={message.proposal} />
+          {onApprove && (
+            <div className="mt-2 flex items-center gap-2">
+              <Button type="button" size="sm" onClick={onApprove}>
+                继续搭建
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                或在下面说明要改什么
+              </span>
+            </div>
+          )}
+        </div>
+      )}
       <Markdown text={message.content ?? ""} />
       <Warnings items={message.warnings} />
       {onHandoff && (
@@ -907,6 +930,11 @@ export default function ChatPage() {
                 onCancel={(id) => void cancel(id)}
                 onRunFlow={(id) => void runFlow(id)}
                 onHandoff={handoff}
+                onApprove={
+                  message.proposal && index === messages.length - 1
+                    ? () => void send(PLAN_APPROVAL, { assistant: true })
+                    : undefined
+                }
               />
             );
           })}

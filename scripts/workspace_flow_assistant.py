@@ -37,6 +37,8 @@ TERRAFLOW_URL = os.environ.get("TERRAFLOW_BASE_URL", "http://127.0.0.1:7861").rs
 PROVIDER = os.environ.get("WORKSPACE_ASSISTANT_PROVIDER", "Qwen")
 MODEL = os.environ.get("WORKSPACE_ASSISTANT_MODEL", "qwen3.8-flash")
 MAX_INPUT = 2000  # Terraflow's assistant request limit
+# Terraflow's flow assistant treats this exact text as approval of its proposed plan.
+PLAN_APPROVAL = "User approved the plan. Proceed with the build."
 Event = tuple[str, dict[str, Any]]
 
 # Component fields worth showing on a graph node (values only; connections are edges).
@@ -271,6 +273,12 @@ def input_layers(data: dict[str, Any]) -> list[dict[str, Any]]:
             pair = str(value("input_set"))
             layers += [{"key": "before", "label": "前期影像", "url": f"/api/workspace/scenes/{pair}.before/preview", "legend": SAR_LEGEND},
                        {"key": "after", "label": "后期影像", "url": f"/api/workspace/scenes/{pair}.after/preview", "legend": SAR_LEGEND}]
+        elif inner.get("type") == "TerraboxGeoRasterCalculateIndex":
+            # Band files exported from a catalog item: show that item's true-colour preview.
+            found = re.search(r"/catalog-bands/([^/]+)/", str(value("band_a_path") or ""))
+            if found and not any(layer["key"] == "optical" for layer in layers):
+                layers.append({"key": "optical", "label": "光学影像（真彩色）",
+                               "url": f"/api/workspace/items/{found.group(1)}/preview", "legend": []})
         elif inner.get("type") == "SceneInput" and value("scene_id"):
             scene = str(value("scene_id"))
             label = "前期影像" if scene.endswith(".before") else "后期影像" if scene.endswith(".after") else "影像"
@@ -348,7 +356,7 @@ class FlowAssistant:
         self.store = store
         self.run_root = web.RUNTIME_DIR / "assistant-runs"
 
-    def _data_hint(self, attachments: list[str]) -> str:
+    def _data_hint(self, attachments: list[str], content: str = "") -> str:
         """Catalog data the geo input components can read: attached items first, else the user's data."""
         index = self.web.read_json(self.web.RUNTIME_DIR / "scene-index.json") or {}
         scenes = {k: v for k, v in index.items() if v.get("category") not in ("synthetic", "test")}
@@ -358,10 +366,51 @@ class FlowAssistant:
                  f"{scenes[sid].get('sensor') or ''}）" for sid in chosen]
         if pairs:
             lines.append("- 成对数据 input_set=" + "、".join(pairs))
-        unusable = [a for a in attachments if a not in scenes]
+        bands = self._optical_bands(attachments, content)
+        optical_ids = {item_id for item_id, _ in bands}
+        unusable = [a for a in attachments if a not in scenes and a not in optical_ids]
         if unusable:
             lines.append("- 附加的 " + "、".join(unusable) + " 不能用 Scene Input 读取（多波段或非栅格），不要使用。")
-        return "\n\n[可用数据，供 Scene Input / Water Input Set 使用]\n" + "\n".join(lines) if lines else ""
+        hint = "\n\n[可用数据，供 Scene Input / Water Input Set 使用]\n" + "\n".join(lines) if lines else ""
+        if bands:
+            hint += ("\n[光学单波段文件（已换算为反射率），直接填到工具的路径字段；NDWI 用 calculate_index，"
+                     "band_a_path=green、band_b_path=nir]\n" + "\n".join(line for _, line in bands))
+        return hint
+
+    def _optical_bands(self, attachments: list[str], content: str) -> list[tuple[str, str]]:
+        """Green and NIR of each optical catalog item as single-band reflectance files (cached).
+
+        Catalog optical items are multi-band; the assistant's tools take one band per path.
+        Listed when the request is about optical data or an optical item is attached.
+        """
+        import data_types as dt
+        import scenario_inputs
+
+        optical = [(item, collection) for item, collection in self.web.CATALOG._uploaded_items()
+                   if (item.get("properties") or {}).get("workspace:data_type") == "optical"]
+        wanted = [pair for pair in optical if pair[0]["id"] in attachments]
+        if not wanted and re.search(r"光学|Sentinel-2|S2|NDWI|optical|多光谱", content, re.IGNORECASE):
+            wanted = optical
+        out = []
+        for item, collection in wanted[:4]:
+            target = self.web.RUNTIME_DIR / "catalog-bands" / item["id"]
+            paths = {}
+            try:
+                for common in ("green", "nir"):
+                    path = target / f"{common}.tif"
+                    if not path.is_file():
+                        href, number, scale, offset, _ = scenario_inputs._optical_band(item, common)
+                        args = ["band", str(href), str(path), "--band", str(number)]
+                        if scale is not None:
+                            args += ["--scale", str(scale), "--offset", str(offset or 0.0)]
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        scenario_inputs._align(self.web, *args)
+                    paths[common] = path
+            except (RuntimeError, KeyError, OSError):
+                continue
+            title = collection.get("title") or item["id"]
+            out.append((item["id"], f"- {title} {dt.item_date(item)}：green={paths['green']}，nir={paths['nir']}"))
+        return out
 
     def _ensure_flow(self, conversation: dict[str, Any], token: str) -> dict[str, Any]:
         flow_id = conversation.get("assistant_flow_id")
@@ -384,8 +433,9 @@ class FlowAssistant:
         return _detached(self._build(conversation_id, content, attachments, token), "流程助手正在搭建工作流")
 
     def _build(self, conversation_id: str, content: str, attachments: list[str], token: str) -> Iterator[Event]:
+        shown = "继续搭建（确认计划）" if content.strip() == PLAN_APPROVAL else content
         user = self.store.append(conversation_id, {"role": "user", "kind": "text", "mode": "assistant",
-                                                   "content": content, "attachments": attachments})
+                                                   "content": shown, "attachments": attachments})
         yield "message", user
         conversation = self.store.load(conversation_id) or {}
         try:
@@ -396,10 +446,11 @@ class FlowAssistant:
             yield from self._fail(conversation_id, str(exc))
             return
         data = flow.get("data") or {"nodes": [], "edges": []}
-        hint = self._data_hint(attachments)
+        hint = self._data_hint(attachments, content)
         text = content[: MAX_INPUT - len(hint)] + hint
         yield "status", {"text": "流程助手正在理解任务…"}
         reply, changed, usage, error, started = "", False, None, None, time.monotonic()
+        proposal = ""
         payload = {"flow_id": flow_id, "input_value": text, "provider": PROVIDER, "model_name": MODEL,
                    "session_id": conversation.get("assistant_session_id")}
         try:
@@ -416,6 +467,9 @@ class FlowAssistant:
                 elif kind == "token":
                     reply += event.get("chunk") or ""
                     yield "token", {"text": event.get("chunk") or ""}
+                elif kind == "flow_update" and event.get("action") == "propose_plan":
+                    proposal = str(event.get("markdown") or "")
+                    yield "status", {"text": "流程助手提出了搭建计划，等你确认"}
                 elif kind == "flow_update" and apply_update(data, event):
                     changed = True
                     yield "flow", {"flow_id": flow_id, "graph": graph(data), "action": event.get("action")}
@@ -448,6 +502,7 @@ class FlowAssistant:
             "usage": usage,
             "custom_components": [n["label"] for n in summary["nodes"] if n["custom"]],
             "checks": domain_checks(summary),
+            "proposal": proposal or None,
         })
         yield "message", message
         yield "done", {}

@@ -90,6 +90,11 @@ const EDIT_RE =
 
 export function routeToAssistant(text: string, messages: ChatMessage[]) {
   if (BUILD_RE.test(text) && !QUESTION_RE.test(text)) return true;
+  // A reply to the flow assistant's proposed plan stays with the assistant.
+  const lastAssistant = [...messages]
+    .reverse()
+    .find((m) => m.role === "assistant");
+  if (lastAssistant?.proposal) return true;
   // Edits go to the assistant when the conversation's current workflow is an assistant-built one.
   const last = [...messages]
     .reverse()

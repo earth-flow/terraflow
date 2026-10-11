@@ -199,6 +199,8 @@ export type ChatMessage = {
   custom_components?: string[];
   /** Scientific problems the workspace found in an assistant-built flow before running. */
   checks?: string[];
+  /** A build plan the flow assistant proposed and is waiting to have approved. */
+  proposal?: string | null;
   created_at?: string;
   content?: string;
   attachments?: string[];
