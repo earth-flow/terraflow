@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import type { ChatMessage, FlowGraph } from "./types";
+import { useWorkspace } from "./workspaceStore";
 
 const PARAM_LABELS: Record<string, string> = {
   scene_id: "数据",
@@ -93,7 +94,8 @@ export function FlowCard({
   return (
     <div className="ws-plan rounded-2xl border p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium">工作流 · 流程助手</span>
+        <span className="text-sm font-medium">工作流</span>
+        <span className="ws-src-ai rounded px-1.5 text-[11px]">流程助手</span>
         <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
           {graph.nodes.length} 个节点 · {graph.edges.length} 条连线
         </span>
@@ -111,8 +113,25 @@ export function FlowCard({
             .join(" · ")}
         </span>
       </div>
-      <div className="mt-3">
-        <FlowGraphView graph={graph} />
+      <div className="mt-2 flex flex-wrap items-center gap-1 text-xs">
+        {graph.nodes
+          .filter(
+            (node) =>
+              node.type !== "ToolResultField" && node.type !== "ChatOutput",
+          )
+          .map((node, index) => (
+            <span key={node.id} className="flex items-center gap-1">
+              {index > 0 && <span className="text-muted-foreground">›</span>}
+              <span
+                className={
+                  "rounded px-1.5 py-0.5 " +
+                  (node.custom ? "ws-flow-node-custom" : "bg-muted")
+                }
+              >
+                {node.label}
+              </span>
+            </span>
+          ))}
       </div>
       {checks.map((note) => (
         <p key={note} className="ws-warning mt-2 rounded-lg px-2 py-1 text-xs">
@@ -125,11 +144,19 @@ export function FlowCard({
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <Button
           type="button"
+          size="sm"
           disabled={busy || !graph.nodes.length}
           onClick={onRun}
         >
           {running ? "执行中…" : "运行工作流"}
         </Button>
+        <button
+          type="button"
+          className="text-xs text-primary underline"
+          onClick={() => useWorkspace.getState().setView("flow")}
+        >
+          在工作流视图查看
+        </button>
         {message.flow_id && (
           <a
             className="text-xs text-primary underline"
@@ -140,9 +167,6 @@ export function FlowCard({
             在 Canvas 中打开
           </a>
         )}
-        <span className="text-xs text-muted-foreground">
-          继续用“搭工作流”模式说明要改什么，助手会在这个工作流上修改。
-        </span>
       </div>
     </div>
   );

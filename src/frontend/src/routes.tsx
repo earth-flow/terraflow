@@ -42,15 +42,11 @@ import ModelProvidersPage from "./pages/SettingsPage/pages/ModelProvidersPage";
 import MessagesPage from "./pages/SettingsPage/pages/messagesPage";
 import ShortcutsPage from "./pages/SettingsPage/pages/ShortcutsPage";
 import ViewPage from "./pages/ViewPage";
-import ChatPage from "./pages/WorkspacePage/ChatPage";
-import {
-  DataPage,
-  FlowsPage,
-  RunsPage,
-  ToolsPage,
-} from "./pages/WorkspacePage/pages";
+import { DataPage, FlowsPage, RunsPage } from "./pages/WorkspacePage/pages";
 import RunDetailPage from "./pages/WorkspacePage/RunDetailPage";
-import ScenariosPage from "./pages/WorkspacePage/ScenariosPage";
+import WorkspaceMain, {
+  ViewRedirect,
+} from "./pages/WorkspacePage/WorkspaceMain";
 import WorkspaceShell from "./pages/WorkspacePage/WorkspaceShell";
 
 const AdminPage = lazy(() => import("./pages/AdminPage"));
@@ -98,12 +94,16 @@ const router = createBrowserRouter(
             <Route path="" element={<AppAuthenticatedPage />}>
               {/* Agent Workspace: its own shell, outside the Langflow dashboard frame. */}
               <Route path="workspace" element={<WorkspaceShell />}>
-                <Route index element={<ChatPage />} />
-                <Route path="c/:conversationId" element={<ChatPage />} />
-                <Route path="data" element={<DataPage />} />
-                <Route path="scenarios" element={<ScenariosPage />} />
+                <Route index element={<WorkspaceMain />} />
+                <Route path="c/:conversationId" element={<WorkspaceMain />} />
+                <Route path="data" element={<ViewRedirect view="data" />} />
+                <Route path="data/manage" element={<DataPage />} />
+                <Route
+                  path="scenarios"
+                  element={<ViewRedirect view="flow" />}
+                />
                 <Route path="flows" element={<FlowsPage />} />
-                <Route path="tools" element={<ToolsPage />} />
+                <Route path="tools" element={<ViewRedirect view="tools" />} />
                 <Route path="runs" element={<RunsPage />} />
                 <Route path="runs/:runId" element={<RunDetailPage />} />
               </Route>

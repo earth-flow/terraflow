@@ -9,7 +9,7 @@ import ReactMarkdown from "react-markdown";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
-import { FlowCard, FlowGraphView } from "./AssistantFlow";
+import { FlowCard } from "./AssistantFlow";
 import {
   API,
   apiFetch,
@@ -26,21 +26,11 @@ import type {
   ChatMessage,
   Conversation,
   FlowGraph,
-  GenericResult,
   PlanInput,
   Scenario,
   StepEvent,
 } from "./types";
-
-type Live = {
-  planId?: string;
-  status: string;
-  text: string;
-  steps: StepEvent[];
-  result?: { run_id: string; result: GenericResult };
-  /** Build-workflow mode: the flow as the assistant edits it. */
-  graph?: FlowGraph;
-};
+import { type Live, routeToAssistant, useWorkspace } from "./workspaceStore";
 
 // Plans written before input slots carry only the runner's input kind.
 const LEGACY_CAPABILITY: Record<string, string> = {
@@ -355,6 +345,7 @@ function MessageView({
   onExecute,
   onCancel,
   onRunFlow,
+  onHandoff,
 }: {
   message: ChatMessage;
   live?: Live;
@@ -367,6 +358,7 @@ function MessageView({
   ) => void;
   onCancel: (id: string) => void;
   onRunFlow: (id: string) => void;
+  onHandoff?: () => void;
 }) {
   if (message.role === "user") {
     return (
@@ -437,9 +429,19 @@ function MessageView({
     );
   }
   return (
-    <div className="max-w-[90%]">
+    <div className="max-w-[95%]">
       <Markdown text={message.content ?? ""} />
       <Warnings items={message.warnings} />
+      {onHandoff && (
+        <button
+          type="button"
+          className="ws-handoff mt-2 rounded-lg px-2.5 py-1 text-xs"
+          onClick={onHandoff}
+          title="没有合适的已验证场景时，可以让流程助手搭建一个工作流"
+        >
+          交给流程助手搭建 →
+        </button>
+      )}
     </div>
   );
 }
@@ -462,12 +464,32 @@ export default function ChatPage() {
   );
   const [picker, setPicker] = useState(false);
   const [draft, setDraft] = useState<Live | null>(null);
-  // "analyze": registered scenarios and the workspace agent; "build": Terraflow's flow assistant.
-  const [mode, setMode] = useState<"analyze" | "build">("analyze");
   const [live, setLive] = useState<Live | null>(null);
+  const ws = useWorkspace();
+  const { mirror, setView, focusResult, setActions } = ws;
   const [error, setError] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
   const busy = Boolean(draft || live);
+
+  useEffect(() => {
+    mirror({ conversationId, messages, draft, live });
+  }, [mirror, conversationId, messages, draft, live]);
+
+  // Requests from the views: data to attach, text to prefill.
+  useEffect(() => {
+    if (!ws.attachRequest.length) return;
+    setAttachments((current) =>
+      Array.from(new Set(current.concat(ws.attachRequest))).slice(
+        -MAX_ATTACHMENTS,
+      ),
+    );
+    ws.requestAttach([]);
+  }, [ws.attachRequest, ws.requestAttach]);
+  useEffect(() => {
+    if (ws.prefill === null) return;
+    setInput(ws.prefill);
+    ws.requestPrefill(null);
+  }, [ws.prefill, ws.requestPrefill]);
 
   const loadList = useCallback(async () => {
     const body = await apiJson<{ conversations: Conversation[] }>(
@@ -501,6 +523,16 @@ export default function ChatPage() {
   }, [messages, draft, live]);
 
   function upsert(message: ChatMessage) {
+    if (
+      message.role === "assistant" &&
+      (message.kind === "plan" || message.kind === "flow")
+    )
+      setView("flow");
+    if (message.kind === "run" && message.result) {
+      focusResult(message.id);
+      // Let the finished nodes show for a moment before the map takes over.
+      setTimeout(() => setView("data"), 1200);
+    }
     setMessages((current) => {
       const index = current.findIndex((item) => item.id === message.id);
       if (index < 0) return current.concat(message);
@@ -538,9 +570,12 @@ export default function ChatPage() {
     return false;
   }
 
-  async function send(text?: string) {
+  async function send(text?: string, options?: { assistant?: boolean }) {
     const content = (text ?? input).trim();
     if (!content || busy) return;
+    const toAssistant =
+      options?.assistant ?? routeToAssistant(content, messages);
+    if (toAssistant) setView("flow");
     setError("");
     let id = conversationId;
     if (!id) {
@@ -564,7 +599,7 @@ export default function ChatPage() {
         API +
           "/conversations/" +
           id +
-          (mode === "build" ? "/assistant" : "/messages"),
+          (toAssistant ? "/assistant" : "/messages"),
         {
           content,
           attachments: sentAttachments,
@@ -581,7 +616,19 @@ export default function ChatPage() {
           );
         else if (event === "status")
           setDraft(
-            (current) => current && { ...current, status: data.text ?? "" },
+            (current) =>
+              current && {
+                ...current,
+                status: data.text ?? "",
+                // Heartbeats repeat the latest line with elapsed time; keep one entry per step.
+                log: (current.log ?? [])
+                  .filter(
+                    (line) =>
+                      !(data.text ?? "").startsWith(line.replace(/….*$/, "")),
+                  )
+                  .concat(data.text ?? "")
+                  .slice(-14),
+              },
           );
         else if (event === "token")
           setDraft(
@@ -603,7 +650,7 @@ export default function ChatPage() {
     } catch (cause) {
       // The flow assistant keeps running on the server and saves its reply
       // even when the stream breaks (seen in Firefox); wait for it instead.
-      if (mode === "build" && sentId) {
+      if (toAssistant && sentId) {
         replied = await waitForReply(id, sentId);
         if (!replied) setError("流程助手长时间没有结果，请稍后刷新会话。");
       } else setError(cause instanceof Error ? cause.message : "发送失败。");
@@ -621,6 +668,7 @@ export default function ChatPage() {
     if (!conversationId || busy) return;
     setError("");
     setLive({ planId, status: "正在提交…", text: "", steps: [] });
+    setView("flow");
     try {
       const response = await postJson(
         API +
@@ -676,6 +724,7 @@ export default function ChatPage() {
     if (!conversationId || busy) return;
     setError("");
     setLive({ planId: messageId, status: "正在提交…", text: "", steps: [] });
+    setView("flow");
     try {
       const response = await postJson(
         API +
@@ -741,91 +790,111 @@ export default function ChatPage() {
 
   const attached = items.filter((item) => attachments.includes(item.id));
 
+  // The views call back into this panel through the store; the ref keeps the latest closures.
+  const handlers = useRef({ send, runFlow, execute });
+  handlers.current = { send, runFlow, execute };
+  useEffect(() => {
+    setActions({
+      send: (text, options) => void handlers.current.send(text, options),
+      runFlow: (id) => void handlers.current.runFlow(id),
+      execute: (id) => void handlers.current.execute(id, false),
+    });
+  }, [setActions]);
+
+  const examples = scenarios
+    .flatMap((scenario) =>
+      scenario.examples.slice(0, 1).map((example) => [example, "已验证场景"]),
+    )
+    .slice(0, 3)
+    .concat([
+      [
+        "搭建一个工作流：用 Sentinel-2 计算色萨利 9 月 10 日的 NDWI，阈值 0 提取水体并计算面积",
+        "流程助手",
+      ],
+    ]);
+
   return (
-    <div className="flex h-full min-h-0 w-full min-w-0">
-      <aside className="ws-sidebar hidden w-64 shrink-0 flex-col border-r border-border md:flex">
-        <div className="p-3">
-          <Button
-            type="button"
-            className="w-full"
-            onClick={() => navigate("/workspace")}
-          >
-            ＋ 新对话
-          </Button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+    <div className="ws-panel flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-2 px-4 pb-2 pt-3">
+        <select
+          aria-label="切换对话"
+          className="ws-conv-select min-w-0 flex-1 truncate rounded-lg bg-transparent py-1 text-sm font-semibold"
+          value={conversationId ?? ""}
+          onChange={(event) =>
+            navigate(
+              event.target.value
+                ? "/workspace/c/" + event.target.value
+                : "/workspace",
+            )
+          }
+        >
+          {!conversationId && <option value="">新对话</option>}
           {conversations.map((item) => (
-            <div
-              key={item.id}
-              className={
-                "group flex items-center gap-1 rounded-lg px-2 py-2 text-sm " +
-                (item.id === conversationId
-                  ? "ws-nav-item-active"
-                  : "ws-nav-item")
-              }
-            >
-              <button
-                type="button"
-                className="min-w-0 flex-1 truncate text-left"
-                onClick={() => navigate("/workspace/c/" + item.id)}
-              >
-                {item.title || "新对话"}
-              </button>
-              <button
-                type="button"
-                className="hidden text-xs text-muted-foreground group-hover:block"
-                aria-label="删除对话"
-                onClick={() => void remove(item.id)}
-              >
-                删除
-              </button>
-            </div>
+            <option key={item.id} value={item.id}>
+              {item.title || "新对话"}
+            </option>
           ))}
-        </div>
-      </aside>
-      <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6 md:px-8">
-          <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
-            {messages.length === 0 && !draft && (
-              <div className="py-10 text-center">
-                <h1 className="text-xl font-semibold">今天想分析什么？</h1>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  描述地点、时间和问题；可以用“＋
-                  添加数据”指定要分析的影像。需要运行时，Agent
-                  会先给出计划请你确认。
-                </p>
-                <div className="mx-auto mt-6 grid max-w-2xl gap-3 sm:grid-cols-2">
-                  {scenarios.flatMap((scenario) =>
-                    scenario.examples.map((example) => (
-                      <button
-                        key={example}
-                        type="button"
-                        className="rounded-xl border border-border bg-card p-3 text-left text-sm hover:border-primary/50"
-                        onClick={() => void send(example)}
-                      >
-                        <span className="block text-xs text-muted-foreground">
-                          {scenario.title}
-                        </span>
-                        {example}
-                      </button>
-                    )),
-                  )}
+        </select>
+        {conversationId && (
+          <button
+            type="button"
+            className="ws-ghost-btn rounded-lg px-2 py-1 text-xs"
+            onClick={() => void remove(conversationId)}
+            title="删除这个对话"
+          >
+            删除
+          </button>
+        )}
+        <button
+          type="button"
+          className="ws-ghost-btn rounded-lg px-2.5 py-1 text-xs"
+          onClick={() => navigate("/workspace")}
+        >
+          ＋ 新对话
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+        <div className="flex w-full flex-col gap-4">
+          {messages.length === 0 && !draft && (
+            <div className="pt-1">
+              <p className="text-sm leading-6 text-muted-foreground">
+                选好地点或数据后直接提问。
+                <b className="text-foreground">已验证的场景</b>
+                按模板生成工作流并经过科学门控；
+                <b className="text-foreground">搭建或修改工作流</b>
+                交给流程助手。两种都会出现在“工作流”视图里，运行结果回到“数据”视图。
+              </p>
+              <div className="mt-3 grid gap-2">
+                {examples.map(([example, source]) => (
                   <button
+                    key={example}
                     type="button"
-                    className="rounded-xl border border-border bg-card p-3 text-left text-sm hover:border-primary/50"
-                    onClick={() =>
-                      void send("你能做哪些分析？现在有哪些数据？")
-                    }
+                    className="ws-suggest rounded-xl p-2.5 text-left text-sm"
+                    onClick={() => void send(example)}
                   >
-                    <span className="block text-xs text-muted-foreground">
-                      了解系统
+                    {example}
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                      {source}
                     </span>
-                    你能做哪些分析？现在有哪些数据？
                   </button>
-                </div>
+                ))}
               </div>
-            )}
-            {messages.map((message) => (
+            </div>
+          )}
+          {messages.map((message, index) => {
+            const previous = messages
+              .slice(0, index)
+              .reverse()
+              .find((item) => item.role === "user");
+            const handoff =
+              message.role === "assistant" &&
+              message.kind === "text" &&
+              message.mode !== "assistant" &&
+              previous?.content &&
+              index === messages.length - 1
+                ? () => void send(previous.content, { assistant: true })
+                : undefined;
+            return (
               <MessageView
                 key={message.id}
                 message={message}
@@ -837,143 +906,95 @@ export default function ChatPage() {
                 }
                 onCancel={(id) => void cancel(id)}
                 onRunFlow={(id) => void runFlow(id)}
+                onHandoff={handoff}
               />
-            ))}
-            {draft && (
-              <div className="max-w-[90%] space-y-2">
-                <p className="text-xs text-muted-foreground">{draft.status}</p>
-                {draft.graph && (
-                  <div className="ws-plan rounded-2xl border p-3">
-                    <p className="mb-2 text-xs text-muted-foreground">
-                      流程助手正在修改工作流
-                    </p>
-                    <FlowGraphView graph={draft.graph} />
-                  </div>
-                )}
-                {draft.text && <Markdown text={draft.text} />}
-              </div>
-            )}
-            {error && <p className="text-sm text-destructive">{error}</p>}
-            <div ref={bottom} />
-          </div>
+            );
+          })}
+          {draft && (
+            <div className="space-y-2">
+              <p className="wv-status text-xs">
+                <span className="ws-spinner" />
+                {draft.status}
+              </p>
+              {draft.text && <Markdown text={draft.text} />}
+            </div>
+          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div ref={bottom} />
         </div>
-        <div className="border-t border-border px-4 py-3 md:px-8">
-          <div className="mx-auto w-full max-w-4xl">
-            {picker && (
-              <div className="mb-3 max-h-96 overflow-y-auto rounded-2xl border border-border bg-card p-3">
-                <p className="mb-3 text-xs text-muted-foreground">
-                  选择要分析的数据（最多 {MAX_ATTACHMENTS}{" "}
-                  份）。只列出现有场景能用的数据；用途由 Agent
-                  在计划里指定，执行前可以更换。
-                </p>
-                <ItemPicker
-                  items={items}
-                  collections={collections}
-                  selected={attachments}
-                  onToggle={(item) =>
+      </div>
+      <div className="px-3 pb-3">
+        {picker && (
+          <div className="mb-2 max-h-80 overflow-y-auto rounded-2xl border border-border bg-card p-3">
+            <p className="mb-2 text-xs text-muted-foreground">
+              选择要分析的数据（最多 {MAX_ATTACHMENTS}{" "}
+              份），也可以在“数据”视图中选中后点“用于提问”。
+            </p>
+            <ItemPicker
+              items={items}
+              collections={collections}
+              selected={attachments}
+              onToggle={(item) =>
+                setAttachments((current) =>
+                  current.includes(item.id)
+                    ? current.filter((id) => id !== item.id)
+                    : current.concat(item.id).slice(-MAX_ATTACHMENTS),
+                )
+              }
+            />
+          </div>
+        )}
+        <div className="ws-composer rounded-2xl p-2.5">
+          <textarea
+            aria-label="输入消息"
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={onKeyDown}
+            rows={2}
+            maxLength={1200}
+            placeholder="描述地点、时间和问题，或说明要搭建、修改的工作流"
+            className="w-full resize-none bg-transparent px-1 text-sm leading-6 outline-none"
+          />
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            {attached.map((item) => (
+              <span
+                key={item.id}
+                className="ws-chip flex items-center gap-1 rounded-md px-2 py-0.5 text-xs"
+              >
+                {item.collection_title.replace(/ · .*/, "")} ·{" "}
+                {item.date ?? item.title}
+                <button
+                  type="button"
+                  aria-label="移除数据"
+                  onClick={() =>
                     setAttachments((current) =>
-                      current.includes(item.id)
-                        ? current.filter((id) => id !== item.id)
-                        : current.concat(item.id).slice(-MAX_ATTACHMENTS),
+                      current.filter((id) => id !== item.id),
                     )
                   }
-                />
-              </div>
-            )}
-            {attached.length > 0 && (
-              <div className="mb-2 flex flex-wrap gap-2">
-                {attached.map((item) => (
-                  <span
-                    key={item.id}
-                    className="ws-chip flex items-center gap-1 rounded-full px-2 py-1 text-xs"
-                  >
-                    {item.collection_title} · {item.date ?? item.title}
-                    <button
-                      type="button"
-                      aria-label="移除数据"
-                      onClick={() =>
-                        setAttachments((current) =>
-                          current.filter((id) => id !== item.id),
-                        )
-                      }
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-            <div
-              className="mb-2 flex flex-wrap items-center gap-2 text-xs"
-              role="radiogroup"
-              aria-label="对话模式"
-            >
-              {(
-                [
-                  ["analyze", "分析", "按已登记的场景选数据、出计划、执行"],
-                  [
-                    "build",
-                    "搭工作流",
-                    "交给 Terraflow 流程助手搭建或修改工作流，再运行",
-                  ],
-                ] as const
-              ).map(([value, label, hint]) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="radio"
-                  aria-checked={mode === value}
-                  title={hint}
-                  onClick={() => setMode(value)}
-                  className={
-                    "rounded-full border px-3 py-1 " +
-                    (mode === value
-                      ? "border-primary bg-primary/10 text-primary"
-                      : "border-border bg-card")
-                  }
                 >
-                  {label}
+                  ×
                 </button>
-              ))}
-              <span className="text-muted-foreground">
-                {mode === "build"
-                  ? "流程助手会搭建可在 Canvas 中打开的工作流；结果只经过 Terrabox 工具自身的检查。"
-                  : "按场景规则选数据和工具顺序，执行前可确认。"}
               </span>
-            </div>
-            <div className="ws-composer flex items-end gap-2 rounded-2xl border border-input bg-background p-2">
-              <button
-                type="button"
-                className="shrink-0 rounded-lg px-2 py-2 text-sm text-primary hover:bg-muted"
-                onClick={() => setPicker((value) => !value)}
-              >
-                ＋ 添加数据
-              </button>
-              <textarea
-                aria-label="输入消息"
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={onKeyDown}
-                rows={2}
-                maxLength={1200}
-                placeholder={
-                  mode === "build"
-                    ? "描述要搭建或修改的工作流，例如：读取色萨利 9 月 13 日的 SAR 影像，提取水体并计算面积"
-                    : "描述地点、时间和想分析的问题（Enter 发送，Shift+Enter 换行）"
-                }
-                className="min-h-[2.5rem] flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-6 outline-none"
-              />
-              <Button
-                type="button"
-                disabled={busy || !input.trim()}
-                onClick={() => void send()}
-              >
-                发送
-              </Button>
-            </div>
+            ))}
+            <button
+              type="button"
+              className="rounded-md px-1.5 py-0.5 text-xs text-primary hover:bg-muted"
+              onClick={() => setPicker((value) => !value)}
+            >
+              ＋ 数据
+            </button>
+            <Button
+              type="button"
+              size="sm"
+              className="ml-auto"
+              disabled={busy || !input.trim()}
+              onClick={() => void send()}
+            >
+              发送
+            </Button>
           </div>
         </div>
-      </section>
+      </div>
     </div>
   );
 }

@@ -1,74 +1,90 @@
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import TerraflowLogo from "@/assets/TerraflowLogo.svg?react";
 import { useLogout } from "@/controllers/API/queries/auth";
+import { useWorkspace, type View } from "./workspaceStore";
 import "./workspace.css";
 
-const NAV = [
+const VIEWS: { id: View; label: string; icon: string }[] = [
   {
-    to: "/workspace",
-    label: "对话",
-    end: false,
-    match: (path: string) =>
-      path === "/workspace" || path.startsWith("/workspace/c/"),
+    id: "data",
+    label: "数据",
+    icon: "M1 3.5l4-2 4 2 4-2v9l-4 2-4-2-4 2z M5 1.5v9 M9 3.5v9",
   },
-  { to: "/workspace/data", label: "数据" },
-  { to: "/workspace/scenarios", label: "场景" },
-  { to: "/workspace/flows", label: "Flow" },
-  { to: "/workspace/tools", label: "工具" },
-  { to: "/workspace/runs", label: "运行记录" },
+  {
+    id: "tools",
+    label: "工具",
+    icon: "M1.5 1.5h4.5v4.5h-4.5z M8 1.5h4.5v4.5h-4.5z M1.5 8h4.5v4.5h-4.5z M8 8h4.5v4.5h-4.5z",
+  },
+  {
+    id: "flow",
+    label: "工作流",
+    icon: "M3 5a2 2 0 1 0 0 4a2 2 0 1 0 0-4 M11 1a2 2 0 1 0 0 4a2 2 0 1 0 0-4 M11 9a2 2 0 1 0 0 4a2 2 0 1 0 0-4 M5 6.3L9 3.7 M5 7.7L9 10.3",
+  },
 ];
 
 export default function WorkspaceShell() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { mutate: logout } = useLogout();
-  const path = window.location.pathname;
+  const view = useWorkspace((s) => s.view);
+  const setView = useWorkspace((s) => s.setView);
+  const conversationId = useWorkspace((s) => s.conversationId);
+  const onMain =
+    location.pathname === "/workspace" ||
+    location.pathname.startsWith("/workspace/c/");
+  function open(next: View) {
+    setView(next);
+    if (!onMain)
+      navigate(
+        conversationId ? "/workspace/c/" + conversationId : "/workspace",
+      );
+  }
   return (
-    <div className="ws-app flex h-screen w-full flex-col bg-background">
-      {/* On narrow screens the navigation wraps onto its own row. */}
-      <header className="ws-topbar flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2 md:h-12 md:flex-nowrap md:py-0">
+    <div className="ws-app flex h-screen w-full flex-col">
+      <header className="ws-topbar ws-glass">
         <button
           type="button"
-          className="flex items-center gap-2 pr-3"
+          className="ws-logo"
           onClick={() => navigate("/workspace")}
         >
           <TerraflowLogo className="h-5 w-5" />
-          <span className="text-sm font-semibold">Agent Workspace</span>
+          <span>Agent Workspace</span>
         </button>
-        <nav
-          aria-label="工作区导航"
-          className="order-last flex w-full min-w-0 gap-1 overflow-x-auto md:order-none md:w-auto md:flex-1"
-        >
-          {NAV.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.to !== "/workspace"}
-              className={({ isActive }) =>
-                "shrink-0 rounded-lg px-3 py-1.5 text-sm " +
-                ((item.match ? item.match(path) : isActive)
-                  ? "ws-nav-item-active"
-                  : "ws-nav-item")
-              }
+        <nav aria-label="视图" className="ws-views">
+          {VIEWS.map((v) => (
+            <button
+              type="button"
+              key={v.id}
+              className={onMain && view === v.id ? "on" : ""}
+              onClick={() => open(v.id)}
             >
-              {item.label}
-            </NavLink>
+              <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
+                <path
+                  d={v.icon}
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                />
+              </svg>
+              {v.label}
+            </button>
           ))}
         </nav>
-        <a
-          href="/flows"
-          style={{ marginLeft: "auto" }}
-          className="shrink-0 rounded-lg px-3 py-1.5 text-sm ws-nav-item"
-          title="Terraflow 原有的 flow 列表与 Canvas 编辑器"
-        >
-          Canvas 编辑器
-        </a>
-        <button
-          type="button"
-          className="shrink-0 rounded-lg px-3 py-1.5 text-sm text-muted-foreground ws-nav-item"
-          onClick={() => logout()}
-        >
-          退出登录
-        </button>
+        <div className="ws-top-r">
+          <button type="button" onClick={() => navigate("/workspace/runs")}>
+            运行记录
+          </button>
+          <a href="/flows" title="Terraflow 原有的 flow 列表与画布编辑器">
+            画布编辑器
+          </a>
+          <span className="ws-live">
+            <i />
+            服务在线
+          </span>
+          <button type="button" onClick={() => logout()}>
+            退出
+          </button>
+        </div>
       </header>
       <main className="min-h-0 flex-1 overflow-hidden">
         <Outlet />

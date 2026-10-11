@@ -257,6 +257,27 @@ def graph(data: dict[str, Any]) -> dict[str, Any]:
     return {"nodes": out_nodes, "edges": out_edges}
 
 
+SAR_LEGEND = [{"color": "linear-gradient(90deg,#000,#fff)", "label": "后向散射"}]
+
+
+def input_layers(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Preview layers for the catalog scenes the flow reads, so masks sit on their images."""
+    layers = []
+    for node in data.get("nodes") or []:
+        inner = (node or {}).get("data") or {}
+        template = (inner.get("node") or {}).get("template") or {}
+        value = lambda field: (template.get(field) or {}).get("value") if isinstance(template.get(field), dict) else None  # noqa: E731
+        if inner.get("type") == "WaterInputSet" and value("input_set"):
+            pair = str(value("input_set"))
+            layers += [{"key": "before", "label": "前期影像", "url": f"/api/workspace/scenes/{pair}.before/preview", "legend": SAR_LEGEND},
+                       {"key": "after", "label": "后期影像", "url": f"/api/workspace/scenes/{pair}.after/preview", "legend": SAR_LEGEND}]
+        elif inner.get("type") == "SceneInput" and value("scene_id"):
+            scene = str(value("scene_id"))
+            label = "前期影像" if scene.endswith(".before") else "后期影像" if scene.endswith(".after") else "影像"
+            layers.append({"key": "scene_" + scene, "label": label, "url": f"/api/workspace/scenes/{scene}/preview", "legend": SAR_LEGEND})
+    return layers
+
+
 def layer_names(data: dict[str, Any]) -> dict[str, str]:
     """Result-layer names from the wiring: a mask made from the before/after scene is
     "前期水体掩膜"/"后期水体掩膜", an index raster is named after its index."""
@@ -497,7 +518,7 @@ class FlowAssistant:
                         "error": None if built.get("valid") else _short(built.get("params")),
                     }
                     steps.append(step)
-                    yield "step", {"id": f"s{step['step']}", "tool": node["label"], "chain": "analysis",
+                    yield "step", {"id": f"s{step['step']}", "tool": node["label"], "node": built.get("id"), "chain": "analysis",
                                    "step": step["step"], "target": None, "reason_code": step["reason_code"],
                                    "state": "done" if step["success"] else "blocked" if step["execution_blocked"]
                                    else "failed", "outputs": _brief(outputs)}
@@ -507,6 +528,7 @@ class FlowAssistant:
             errors.append(str(exc))
         run_id = "af_" + time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         result = self._result(run_id, flow_id, steps, errors, message, layer_names(data))
+        result["layers"] = input_layers(data) + result["layers"]
         result["seconds"] = round(time.monotonic() - started, 1)
         self.run_root.mkdir(parents=True, exist_ok=True)
         (self.run_root / f"{run_id}.json").write_text(json.dumps(
