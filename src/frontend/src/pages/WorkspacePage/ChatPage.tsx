@@ -510,6 +510,34 @@ export default function ChatPage() {
     });
   }
 
+  /** Poll the conversation until an assistant message follows `afterId` (up to 30 min). */
+  async function waitForReply(id: string, afterId: string) {
+    setDraft((current) => ({
+      status: "连接中断，流程助手仍在服务器上运行，正在等待结果…",
+      text: current?.text ?? "",
+      steps: [],
+      graph: current?.graph,
+    }));
+    for (let attempt = 0; attempt < 600; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      try {
+        const body = await apiJson<Conversation>(API + "/conversations/" + id);
+        const list = body.messages ?? [];
+        const index = list.findIndex((item) => item.id === afterId);
+        if (
+          index >= 0 &&
+          list.slice(index + 1).some((m) => m.role === "assistant")
+        ) {
+          setMessages(list);
+          return true;
+        }
+      } catch {
+        // keep waiting through transient errors
+      }
+    }
+    return false;
+  }
+
   async function send(text?: string) {
     const content = (text ?? input).trim();
     if (!content || busy) return;
@@ -529,6 +557,8 @@ export default function ChatPage() {
     setAttachments([]);
     setPicker(false);
     setDraft({ status: "正在发送…", text: "", steps: [] });
+    let sentId = "";
+    let replied = false;
     try {
       const response = await postJson(
         API +
@@ -558,14 +588,25 @@ export default function ChatPage() {
             (current) =>
               current && { ...current, text: current.text + data.text },
           );
+        else if (event === "error")
+          setError(String(data.text ?? "流程助手出错。"));
         else if (event === "message") {
-          upsert(data as unknown as ChatMessage);
-          if ((data as unknown as ChatMessage).role === "assistant")
+          const message = data as unknown as ChatMessage;
+          upsert(message);
+          if (message.role === "user") sentId = message.id;
+          if (message.role === "assistant") {
+            replied = true;
             setDraft(null);
+          }
         }
       });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "发送失败。");
+      // The flow assistant keeps running on the server and saves its reply
+      // even when the stream breaks (seen in Firefox); wait for it instead.
+      if (mode === "build" && sentId) {
+        replied = await waitForReply(id, sentId);
+        if (!replied) setError("流程助手长时间没有结果，请稍后刷新会话。");
+      } else setError(cause instanceof Error ? cause.message : "发送失败。");
     } finally {
       setDraft(null);
       void loadList().catch(() => undefined);

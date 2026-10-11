@@ -24,9 +24,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -71,6 +73,76 @@ def _request(method: str, path: str, token: str, payload: Any = None, timeout: i
     except URLError as exc:
         raise TerraflowError(f"无法连接 Terraflow：{exc}") from exc
     return json.loads(raw) if raw else None
+
+
+def _get_flow(flow_id: str, token: str, attempts: int = 5) -> dict[str, Any]:
+    """GET a flow, retrying a 404 briefly: under load a just-created flow can
+    be read before Terraflow's create transaction is visible."""
+    for attempt in range(attempts):
+        try:
+            return _request("GET", f"/api/v1/flows/{flow_id}", token)
+        except TerraflowError as exc:
+            if " 404" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+# Terraflow assistant tool names and steps, in the workspace's words.
+TOOL_LABELS = {
+    "search_components": "查找组件", "describe_component": "查看组件说明", "describe_flow_io": "查看工作流输入输出",
+    "get_field_value": "读取参数", "build_flow": "生成工作流", "add_component": "添加节点",
+    "connect_components": "连线", "configure_component": "设置参数", "remove_component": "删除节点",
+    "run_flow": "试运行工作流", "propose_plan": "拟定计划", "generate_component": "编写自定义组件",
+}
+STEP_LABELS = {
+    "generating_flow": "流程助手正在构思工作流…", "generation_complete": "流程助手已完成，正在检查…",
+    "retrying": "检查发现问题，流程助手正在修改…", "validating": "正在试运行检查工作流…",
+    "flow_proposal_ready": "工作流已生成",
+}
+
+
+def progress_text(event: dict[str, Any]) -> str:
+    """Status line for a Terraflow progress event; tool calls read e.g. "查找组件：threshold"."""
+    step, message = event.get("step") or "", event.get("message") or ""
+    if step in {"searching_components", "building_flow"} and message:
+        name, _, argument = message.partition(": ")
+        label = TOOL_LABELS.get(name, name)
+        return f"{label}：{argument}" if argument else label
+    return STEP_LABELS.get(step) or message or "处理中…"
+
+
+def _detached(events: Iterator[Event], waiting: str, heartbeat: float = 15.0) -> Iterator[Event]:
+    """Run *events* to completion in a worker thread and relay them.
+
+    The assistant can stay silent for minutes; a status line every *heartbeat*
+    seconds keeps proxies from closing the stream, and if the page disconnects
+    anyway the worker still finishes and stores its message, so a reload shows it.
+    """
+    queue: Queue[Event | None] = Queue()
+
+    def work() -> None:
+        try:
+            for item in events:
+                queue.put(item)
+        except Exception as exc:  # noqa: BLE001 - reported to the page instead of a dead stream
+            queue.put(("error", {"text": f"流程助手出错：{exc}"}))
+        finally:
+            queue.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+    started, last = time.monotonic(), f"{waiting}…"
+    while True:
+        try:
+            item = queue.get(timeout=heartbeat)
+        except Empty:
+            yield "status", {"text": f"{last.rstrip('…')}…（已用 {round(time.monotonic() - started)} s）"}
+            continue
+        if item is None:
+            return
+        if item[0] == "status":
+            last = item[1].get("text") or last
+        yield item
 
 
 def _stream_lines(path: str, token: str, payload: Any, timeout: int, accept: str) -> Iterator[str]:
@@ -229,12 +301,11 @@ class FlowAssistant:
             lines.append("- 附加的 " + "、".join(unusable) + " 不能用 Scene Input 读取（多波段或非栅格），不要使用。")
         return "\n\n[可用数据，供 Scene Input / Water Input Set 使用]\n" + "\n".join(lines) if lines else ""
 
-    def _ensure_flow(self, conversation: dict[str, Any], token: str) -> str:
+    def _ensure_flow(self, conversation: dict[str, Any], token: str) -> dict[str, Any]:
         flow_id = conversation.get("assistant_flow_id")
         if flow_id:
             try:
-                _request("GET", f"/api/v1/flows/{flow_id}", token)
-                return flow_id
+                return _get_flow(flow_id, token)
             except TerraflowError:
                 pass  # deleted on the canvas: start a new one
         title = (conversation.get("title") or "工作区工作流")[:40]
@@ -245,17 +316,20 @@ class FlowAssistant:
         })
         self.store.set_meta(conversation["id"], assistant_flow_id=flow["id"],
                             assistant_session_id=str(uuid.uuid4()))
-        return flow["id"]
+        return flow
 
     def build(self, conversation_id: str, content: str, attachments: list[str], token: str) -> Iterator[Event]:
+        return _detached(self._build(conversation_id, content, attachments, token), "流程助手正在搭建工作流")
+
+    def _build(self, conversation_id: str, content: str, attachments: list[str], token: str) -> Iterator[Event]:
         user = self.store.append(conversation_id, {"role": "user", "kind": "text", "mode": "assistant",
                                                    "content": content, "attachments": attachments})
         yield "message", user
         conversation = self.store.load(conversation_id) or {}
         try:
-            flow_id = self._ensure_flow(conversation, token)
+            flow = self._ensure_flow(conversation, token)
+            flow_id = flow["id"]
             conversation = self.store.load(conversation_id) or {}
-            flow = _request("GET", f"/api/v1/flows/{flow_id}", token)
         except TerraflowError as exc:
             yield from self._fail(conversation_id, str(exc))
             return
@@ -276,7 +350,7 @@ class FlowAssistant:
                     continue
                 kind = event.get("event")
                 if kind == "progress":
-                    yield "status", {"text": event.get("message") or "处理中…"}
+                    yield "status", {"text": progress_text(event)}
                 elif kind == "token":
                     reply += event.get("chunk") or ""
                     yield "token", {"text": event.get("chunk") or ""}
@@ -325,6 +399,9 @@ class FlowAssistant:
     # ------------------------------------------------------------------ run
 
     def run(self, conversation_id: str, message_id: str, token: str) -> Iterator[Event]:
+        return _detached(self._run_locked(conversation_id, message_id, token), "工作流正在执行")
+
+    def _run_locked(self, conversation_id: str, message_id: str, token: str) -> Iterator[Event]:
         conversation = self.store.load(conversation_id) or {}
         message = next((m for m in conversation.get("messages", []) if m.get("id") == message_id), None)
         if not message or message.get("kind") != "flow":
@@ -341,7 +418,7 @@ class FlowAssistant:
     def _run(self, conversation_id: str, message: dict[str, Any], token: str) -> Iterator[Event]:
         flow_id = message["flow_id"]
         try:
-            flow = _request("GET", f"/api/v1/flows/{flow_id}", token)
+            flow = _get_flow(flow_id, token)
         except TerraflowError as exc:
             yield "error", {"text": str(exc)}
             return
