@@ -84,7 +84,11 @@ def load_registry_with_user_overlay(*, user_id: str | None) -> dict[str, dict]:
         - A specific user file is unreadable, oversized, or empty.
     Collisions with base type names are dropped (base wins).
     """
-    base_registry = load_local_registry()
+    # The bundled index has no Terrabox tool components: they are generated at
+    # runtime from the live Terrabox catalog for the canvas sidebar. Without them
+    # the assistant cannot find e.g. a threshold or water-area tool and writes a
+    # replacement component instead, bypassing the tools' scientific checks.
+    base_registry = {**_terrabox_registry_entries(), **load_local_registry()}
 
     if user_id is None:
         return base_registry
@@ -127,6 +131,28 @@ def load_registry_with_user_overlay(*, user_id: str | None) -> dict[str, dict]:
     merged = dict(base_registry)
     merged.update(overlay)
     return merged
+
+
+def _terrabox_registry_entries() -> dict[str, dict]:
+    """Generated Terrabox tool components from the running component cache, as registry entries.
+
+    Each entry keeps its generated template; ``category`` is set to the Terrabox
+    toolkit (e.g. ``geo_water``) so ``search_components`` can find tools by
+    toolkit as well as by class name (``Terrabox<Toolkit><Tool>``). Empty when the
+    cache is not built yet or Terrabox components are disabled.
+    """
+    try:
+        from lfx.interface import earthflow_components
+        from lfx.interface.components import component_cache
+    except ImportError:
+        return {}
+    all_types = component_cache.all_types_dict or {}
+    entries: dict[str, dict] = {}
+    for category in sorted(earthflow_components._terrabox_categories_seen):  # noqa: SLF001
+        for name, template in (all_types.get(category) or {}).items():
+            if isinstance(template, dict):
+                entries[name] = {**template, "category": category}
+    return entries
 
 
 def load_registry_for_current_user() -> dict[str, dict]:

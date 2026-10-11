@@ -594,6 +594,70 @@ async def build_toolkit() -> list:
     return tools
 
 
+GEO_PROMPT_ADDENDUM = """
+
+## Geospatial flows with Terrabox tools (CRITICAL)
+
+Raster and geospatial analysis (remote sensing, water, flood, SAR, NDWI,
+GeoTIFF, area, threshold, raster statistics) is done with the **Terrabox tool
+components**. They are built-ins: search by class name prefix `Terrabox` or by
+toolkit category (`geo_water`, `geo_raster`, `raster_viewer`, `geo_basic`,
+`geo_statistics`), e.g. `search_components(query="threshold")`,
+`search_components(category="geo_water")`. Each one calls the Terrabox
+service, which applies the scientific checks (grid preflight, 0/1 labels,
+projected area grids).
+
+- **NEVER generate a custom component that re-implements a Terrabox tool**
+  (thresholding, segmentation, NDWI/indices, raster stats, water area, grid
+  checks, raster inspection). If a Terrabox tool exists for the step, use it.
+  Generate a component only for a step no Terrabox tool covers, and say so.
+- **Inputs are server paths, not uploads.** Use `SceneInput` (set `scene_id`,
+  e.g. `thessaly_2023_s1.after`) for one catalog raster, or `WaterInputSet`
+  (set `input_set`, e.g. `thessaly_2023_s1`) for a before/after pair. Wire their
+  `path` / `before_path` / `after_path` outputs (Message) into the tool's path
+  input. Never use File / file-content components for these rasters.
+- **Chaining tools:** a Terrabox tool returns its result on `api_run_model`
+  (Data). To pass an output file to the next tool, add a `ToolResultField` with
+  `field_path = "outputs.output_path"`: tool `api_run_model` → ToolResultField
+  `result`; ToolResultField `value` → next tool's path input.
+- **Outputs:** set every `output_path` under {output_dir}/ (a new file name per
+  step), never next to the input rasters.
+- **SAR backscatter water mask** (`TerraboxGeoRasterThresholdSegmentation`):
+  `input_transform="db"`, `method="otsu"`, `otsu_range="[-35.0, 5.0]"`,
+  `direction="below"`, `foreground_value=1`, `background_value=0`,
+  `nodata_value=255`. **NDWI water**: `TerraboxGeoRasterCalculateIndex` on
+  green and NIR, then threshold with `method="fixed"`, `threshold=0`,
+  `direction="above"`, same label values.
+- **Order:** inspect (`TerraboxRasterViewerInspectGeotiff`) first; for two
+  dates run `TerraboxGeoWaterRasterProfilePreflight` on the pair before any
+  pairwise step; measure area only with `TerraboxGeoWaterWaterExtent` (one
+  mask, `label_path`) or `TerraboxGeoWaterWaterEvidence` (two masks). Do not
+  compute areas yourself.
+
+Example (water area of one SAR scene): SceneInput(scene_id) `path` →
+TerraboxRasterViewerInspectGeotiff `raster_path`; SceneInput `path` →
+TerraboxGeoRasterThresholdSegmentation `input_path` (SAR preset above,
+`output_path` under the output folder); its `api_run_model` → ToolResultField
+(`outputs.output_path`) `result`; ToolResultField `value` →
+TerraboxGeoWaterWaterExtent `label_path`.
+"""
+
+
+def geo_prompt_addendum() -> str:
+    """Terrabox rules for the flow builder; empty when Terrabox components are not in the registry."""
+    try:
+        from terraflow.agentic.services.user_components_overlay import _terrabox_registry_entries
+    except ImportError:
+        return ""
+    if not _terrabox_registry_entries():
+        return ""
+    import os
+
+    runtime = os.environ.get("TERRAFLOW_WATER_RUNTIME_DIR")
+    output_dir = f"{runtime.rstrip('/')}/canvas-runs/assistant" if runtime else "a dedicated outputs folder"
+    return GEO_PROMPT_ADDENDUM.replace("{output_dir}", output_dir)
+
+
 def build_system_prompt() -> str:
     """Assemble the agent's system prompt for the current environment.
 
@@ -601,7 +665,7 @@ def build_system_prompt() -> str:
     unit tested directly (a tool must never be mentioned in the prompt unless
     ``build_toolkit()`` actually registers it — see ``assistant_cli_tool_enabled``).
     """
-    system_prompt = FLOW_BUILDER_PROMPT
+    system_prompt = FLOW_BUILDER_PROMPT + geo_prompt_addendum()
     if assistant_cli_tool_enabled():
         system_prompt += CLI_TOOL_PROMPT_ADDENDUM
     return system_prompt
