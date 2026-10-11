@@ -628,6 +628,11 @@ projected area grids).
   `nodata_value=255`. **NDWI water**: `TerraboxGeoRasterCalculateIndex` on
   green and NIR, then threshold with `method="fixed"`, `threshold=0`,
   `direction="above"`, same label values.
+- **Two dates use ONE threshold:** run Otsu on the AFTER scene only; threshold
+  the BEFORE scene with `method="fixed"` and the same value — wire the after
+  tool's `api_run_model` → a `ToolResultField` (`field_path = "outputs.threshold"`)
+  → the before tool's `threshold`. Never run Otsu separately on each date: a
+  dry pre-event scene gives a meaningless threshold and hides the new water.
 - **Order:** inspect (`TerraboxRasterViewerInspectGeotiff`) first; for two
   dates run `TerraboxGeoWaterRasterProfilePreflight` on the pair before any
   pairwise step; measure area only with `TerraboxGeoWaterWaterExtent` (one

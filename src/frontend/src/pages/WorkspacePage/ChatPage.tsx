@@ -9,6 +9,7 @@ import ReactMarkdown from "react-markdown";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
+import { FlowCard, FlowGraphView } from "./AssistantFlow";
 import {
   API,
   apiFetch,
@@ -24,6 +25,7 @@ import type {
   CatalogItem,
   ChatMessage,
   Conversation,
+  FlowGraph,
   GenericResult,
   PlanInput,
   Scenario,
@@ -36,6 +38,8 @@ type Live = {
   text: string;
   steps: StepEvent[];
   result?: { run_id: string; result: GenericResult };
+  /** Build-workflow mode: the flow as the assistant edits it. */
+  graph?: FlowGraph;
 };
 
 // Plans written before input slots carry only the runner's input kind.
@@ -350,6 +354,7 @@ function MessageView({
   items,
   onExecute,
   onCancel,
+  onRunFlow,
 }: {
   message: ChatMessage;
   live?: Live;
@@ -361,6 +366,7 @@ function MessageView({
     inputs?: Record<string, string>,
   ) => void;
   onCancel: (id: string) => void;
+  onRunFlow: (id: string) => void;
 }) {
   if (message.role === "user") {
     return (
@@ -373,6 +379,29 @@ function MessageView({
             </p>
           ) : null}
         </div>
+      </div>
+    );
+  }
+  if (message.kind === "flow") {
+    return (
+      <div className="space-y-2">
+        {message.content && (
+          <div className="max-w-[90%]">
+            <Markdown text={message.content} />
+          </div>
+        )}
+        <FlowCard
+          message={message}
+          busy={busy}
+          running={Boolean(live)}
+          onRun={() => onRunFlow(message.id)}
+        />
+        {live && (
+          <div className="rounded-2xl border border-border bg-card p-3">
+            <p className="text-xs text-muted-foreground">{live.status}</p>
+            <StepList steps={live.steps} />
+          </div>
+        )}
       </div>
     );
   }
@@ -433,6 +462,8 @@ export default function ChatPage() {
   );
   const [picker, setPicker] = useState(false);
   const [draft, setDraft] = useState<Live | null>(null);
+  // "analyze": registered scenarios and the workspace agent; "build": Terraflow's flow assistant.
+  const [mode, setMode] = useState<"analyze" | "build">("analyze");
   const [live, setLive] = useState<Live | null>(null);
   const [error, setError] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
@@ -500,14 +531,25 @@ export default function ChatPage() {
     setDraft({ status: "正在发送…", text: "", steps: [] });
     try {
       const response = await postJson(
-        API + "/conversations/" + id + "/messages",
+        API +
+          "/conversations/" +
+          id +
+          (mode === "build" ? "/assistant" : "/messages"),
         {
           content,
           attachments: sentAttachments,
         },
       );
       await readEvents(response, (event, data) => {
-        if (event === "status")
+        if (event === "flow")
+          setDraft(
+            (current) =>
+              current && {
+                ...current,
+                graph: (data as unknown as { graph: FlowGraph }).graph,
+              },
+          );
+        else if (event === "status")
           setDraft(
             (current) => current && { ...current, status: data.text ?? "" },
           );
@@ -582,6 +624,44 @@ export default function ChatPage() {
         API + "/conversations/" + conversationId,
       );
       setMessages(body.messages ?? []);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "执行失败。");
+    } finally {
+      setLive(null);
+    }
+  }
+
+  async function runFlow(messageId: string) {
+    if (!conversationId || busy) return;
+    setError("");
+    setLive({ planId: messageId, status: "正在提交…", text: "", steps: [] });
+    try {
+      const response = await postJson(
+        API +
+          "/conversations/" +
+          conversationId +
+          "/assistant-flows/" +
+          messageId +
+          "/run",
+        {},
+      );
+      await readEvents(response, (event, data) => {
+        setLive((current) => {
+          if (!current) return current;
+          if (event === "status")
+            return { ...current, status: data.text ?? "" };
+          if (event === "error")
+            return { ...current, status: "出错：" + data.text };
+          if (event === "step")
+            return {
+              ...current,
+              steps: current.steps.concat(data as unknown as StepEvent),
+            };
+          return current;
+        });
+        if (event === "error") setError(String(data.text ?? "执行失败。"));
+        if (event === "message") upsert(data as unknown as ChatMessage);
+      });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "执行失败。");
     } finally {
@@ -715,11 +795,20 @@ export default function ChatPage() {
                   void execute(id, selfCheck, inputs)
                 }
                 onCancel={(id) => void cancel(id)}
+                onRunFlow={(id) => void runFlow(id)}
               />
             ))}
             {draft && (
-              <div className="max-w-[90%]">
+              <div className="max-w-[90%] space-y-2">
                 <p className="text-xs text-muted-foreground">{draft.status}</p>
+                {draft.graph && (
+                  <div className="ws-plan rounded-2xl border p-3">
+                    <p className="mb-2 text-xs text-muted-foreground">
+                      流程助手正在修改工作流
+                    </p>
+                    <FlowGraphView graph={draft.graph} />
+                  </div>
+                )}
                 {draft.text && <Markdown text={draft.text} />}
               </div>
             )}
@@ -773,6 +862,44 @@ export default function ChatPage() {
                 ))}
               </div>
             )}
+            <div
+              className="mb-2 flex flex-wrap items-center gap-2 text-xs"
+              role="radiogroup"
+              aria-label="对话模式"
+            >
+              {(
+                [
+                  ["analyze", "分析", "按已登记的场景选数据、出计划、执行"],
+                  [
+                    "build",
+                    "搭工作流",
+                    "交给 Terraflow 流程助手搭建或修改工作流，再运行",
+                  ],
+                ] as const
+              ).map(([value, label, hint]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={mode === value}
+                  title={hint}
+                  onClick={() => setMode(value)}
+                  className={
+                    "rounded-full border px-3 py-1 " +
+                    (mode === value
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-border bg-card")
+                  }
+                >
+                  {label}
+                </button>
+              ))}
+              <span className="text-muted-foreground">
+                {mode === "build"
+                  ? "流程助手会搭建可在 Canvas 中打开的工作流；结果只经过 Terrabox 工具自身的检查。"
+                  : "按场景规则选数据和工具顺序，执行前可确认。"}
+              </span>
+            </div>
             <div className="ws-composer flex items-end gap-2 rounded-2xl border border-input bg-background p-2">
               <button
                 type="button"
@@ -788,7 +915,11 @@ export default function ChatPage() {
                 onKeyDown={onKeyDown}
                 rows={2}
                 maxLength={1200}
-                placeholder="描述地点、时间和想分析的问题（Enter 发送，Shift+Enter 换行）"
+                placeholder={
+                  mode === "build"
+                    ? "描述要搭建或修改的工作流，例如：读取色萨利 9 月 13 日的 SAR 影像，提取水体并计算面积"
+                    : "描述地点、时间和想分析的问题（Enter 发送，Shift+Enter 换行）"
+                }
                 className="min-h-[2.5rem] flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-6 outline-none"
               />
               <Button

@@ -148,3 +148,11 @@
 .ws-text-warning {
   color: hsl(var(--warning-foreground));
 }
+.ws-flow-node-tool {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.06);
+}
+.ws-flow-node-custom {
+  border-color: hsl(var(--warning) / 0.6);
+  background: hsl(var(--warning) / 0.1);
+}

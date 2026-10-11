@@ -1136,6 +1136,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "scenes"] and parts[4] == "preview":
             self._send_png(LIBRARY.preview(parts[3]))
             return
+        if len(parts) == 6 and parts[:3] == ["api", "water-demo", "assistant-runs"] and parts[4] == "preview":
+            index = int(parts[5]) if parts[5].isdigit() else -1
+            self._send_png(FLOW_ASSISTANT.preview(parts[3], index))
+            return
         if len(parts) == 5 and parts[:3] == ["api", "water-demo", "items"] and parts[4] == "preview":
             self._send_png(CATALOG.preview(parts[3]))
             return
@@ -1254,6 +1258,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             attachments = [str(item) for item in (payload.get("attachments") or []) if isinstance(item, str)][:4]
             self._stream(AGENT.handle_message(parts[3], content, attachments))
+            return
+        if len(parts) == 5 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "assistant":
+            payload = self._read_json_body() or {}
+            content = str(payload.get("content") or "").strip()[:MAX_PROMPT_LENGTH]
+            if not content or AGENT.store.load(parts[3]) is None:
+                self._send(400, {"status": "invalid_request", "error": "会话不存在或消息为空。"})
+                return
+            attachments = [str(item) for item in (payload.get("attachments") or []) if isinstance(item, str)][:4]
+            self._stream(FLOW_ASSISTANT.build(parts[3], content, attachments, request_token(self.headers) or ""))
+            return
+        if len(parts) == 7 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "assistant-flows" \
+                and parts[6] == "run":
+            self._stream(FLOW_ASSISTANT.run(parts[3], parts[5], request_token(self.headers) or ""))
             return
         if len(parts) == 7 and parts[:3] == ["api", "water-demo", "conversations"] and parts[4] == "plans":
             if parts[6] == "execute":
@@ -1411,11 +1428,13 @@ import data_catalog  # noqa: E402
 import data_types  # noqa: E402
 import scene_library  # noqa: E402
 import workspace_agent  # noqa: E402
+import workspace_flow_assistant  # noqa: E402
 import workspace_scenarios  # noqa: E402
 
 LIBRARY = scene_library.SceneLibrary(sys.modules[__name__])
 CATALOG = data_catalog.DataCatalog(sys.modules[__name__])
 AGENT = workspace_agent.WorkspaceAgent(sys.modules[__name__])
+FLOW_ASSISTANT = workspace_flow_assistant.FlowAssistant(sys.modules[__name__], AGENT.store)
 
 
 def run_result(run_id: str) -> dict[str, Any] | None:

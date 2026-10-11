@@ -18,11 +18,20 @@ type EvidenceRecord = {
   reason_code?: string | null;
 };
 
-function EvidenceView({ runId }: { runId: string }) {
-  const [records, setRecords] = useState<EvidenceRecord[] | null>(null);
+function EvidenceView({
+  runId,
+  inline,
+}: {
+  runId: string;
+  inline?: EvidenceRecord[];
+}) {
+  const [records, setRecords] = useState<EvidenceRecord[] | null>(
+    inline ?? null,
+  );
   const [open, setOpen] = useState<string | null>(null);
   const [error, setError] = useState("");
   useEffect(() => {
+    if (inline) return;
     void apiFetch(API + "/runs/" + encodeURIComponent(runId) + "/evidence")
       .then(async (response) => {
         const body = (await response.json()) as {
@@ -35,7 +44,7 @@ function EvidenceView({ runId }: { runId: string }) {
       .catch((cause) =>
         setError(cause instanceof Error ? cause.message : "证据无法读取。"),
       );
-  }, [runId]);
+  }, [runId, inline]);
   if (error) return <p className="text-xs text-destructive">{error}</p>;
   if (!records)
     return <p className="text-xs text-muted-foreground">正在读取证据…</p>;
@@ -121,6 +130,10 @@ export default function ResultView({
   const [canvasNote, setCanvasNote] = useState("");
 
   async function openCanvas() {
+    if (result.canvas_url) {
+      window.open(result.canvas_url, "_blank");
+      return;
+    }
     const tab = window.open("about:blank", "_blank");
     setCanvasNote("正在生成 flow…");
     try {
@@ -260,7 +273,12 @@ export default function ResultView({
           <span className="text-muted-foreground">{canvasNote}</span>
         )}
       </div>
-      {showEvidence && <EvidenceView runId={runId} />}
+      {showEvidence && (
+        <EvidenceView
+          runId={runId}
+          inline={result.steps_inline as EvidenceRecord[] | undefined}
+        />
+      )}
     </div>
   );
 }

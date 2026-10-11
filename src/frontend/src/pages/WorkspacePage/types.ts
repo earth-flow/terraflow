@@ -108,6 +108,9 @@ export type GenericResult = {
   scenario: string;
   /** False when the scenario has no Canvas flow builder; absent on older results. */
   canvas?: boolean;
+  /** Runs of an assistant-built workflow link the flow directly and carry their steps. */
+  canvas_url?: string;
+  steps_inline?: Record<string, unknown>[];
   status: "success" | "blocked";
   headline: string;
   metrics: Metric[];
@@ -171,10 +174,31 @@ export type PlanInfo = {
   inputs_changed_by_user?: boolean;
 };
 
+export type FlowGraph = {
+  nodes: {
+    id: string;
+    type: string;
+    label: string;
+    terrabox: boolean;
+    custom: boolean;
+    params: Record<string, unknown>;
+  }[];
+  edges: { source: string; target: string; output?: string; input?: string }[];
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
-  kind: "text" | "plan" | "run";
+  kind: "text" | "plan" | "run" | "flow";
+  /** "assistant" for messages of the build-workflow mode (Terraflow's flow assistant). */
+  mode?: string;
+  flow_id?: string;
+  graph?: FlowGraph;
+  seconds?: number;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  custom_components?: string[];
+  /** Scientific problems the workspace found in an assistant-built flow before running. */
+  checks?: string[];
   created_at?: string;
   content?: string;
   attachments?: string[];

@@ -116,6 +116,14 @@ class ConversationStore:
             self.save(conversation)
             return message
 
+    def set_meta(self, conversation_id: str, **fields: Any) -> None:
+        """Conversation-level fields (e.g. the flow the flow assistant edits)."""
+        with self.lock:
+            conversation = self.load(conversation_id)
+            if conversation is not None:
+                conversation.update(fields)
+                self.save(conversation)
+
     def update(self, conversation_id: str, message_id: str, **fields: Any) -> dict[str, Any] | None:
         with self.lock:
             conversation = self.load(conversation_id)
