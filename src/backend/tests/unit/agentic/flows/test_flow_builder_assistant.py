@@ -770,3 +770,31 @@ class TestIntentClassificationBuildFlow:
             api_key_var="OPENAI_API_KEY",
         )
         assert result.intent == "generate_component", f"Expected generate_component, got {result.intent}"
+
+
+class TestGeoProfile:
+    """TERRAFLOW_ASSISTANT_PROFILE=geo trims tools and prompt sections the Terrabox workspace never uses."""
+
+    def test_geo_profile_drops_file_and_agent_model_sections(self, monkeypatch):
+        from terraflow.agentic.flows import flow_builder_assistant as fba
+
+        monkeypatch.delenv("TERRAFLOW_ASSISTANT_PROFILE", raising=False)
+        full = fba.build_system_prompt()
+        monkeypatch.setenv("TERRAFLOW_ASSISTANT_PROFILE", "geo")
+        geo = fba.build_system_prompt()
+        for start, _ in fba.GEO_PROFILE_DROPPED_SECTIONS:
+            assert start in full
+            assert start not in geo
+        for gone in ("write_file", "docx_create", "glob_search"):
+            assert gone not in geo
+        assert "## Creating new custom components" in geo
+        assert "## Examples" in geo
+        assert len(geo) < len(full) - 6000
+
+    async def test_geo_profile_toolkit_has_no_file_or_word_tools(self, monkeypatch):
+        from terraflow.agentic.flows import flow_builder_assistant as fba
+
+        monkeypatch.setenv("TERRAFLOW_ASSISTANT_PROFILE", "geo")
+        names = {tool.name for tool in await fba.build_toolkit()}
+        assert {"build_flow", "search_components", "describe_component", "run_flow"} <= names
+        assert not names & {"read_file", "write_file", "edit_file", "glob_search", "grep_search", "docx_create"}

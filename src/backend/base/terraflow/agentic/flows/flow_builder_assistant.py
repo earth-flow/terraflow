@@ -12,6 +12,7 @@ from lfx.components.files_and_knowledge.word_document import WordDocumentToolCom
 from lfx.components.input_output import ChatInput, ChatOutput
 from lfx.components.models_and_agents import AgentComponent
 from lfx.graph import Graph
+from lfx.log.logger import logger
 from lfx.mcp.flow_builder_tools import (
     AddComponent,
     BuildFlowFromSpec,
@@ -44,6 +45,35 @@ EARTHFLOW_ASSISTANT_CLI_TOOL_ENABLED = "EARTHFLOW_ASSISTANT_CLI_TOOL_ENABLED"
 def assistant_cli_tool_enabled() -> bool:
     value = os.getenv(EARTHFLOW_ASSISTANT_CLI_TOOL_ENABLED, "0").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+# Deployment profile of the flow builder. "geo" (Terrabox water/remote-sensing workspace) drops
+# the sandboxed file and Word tools and the prompt sections that only serve chat-agent flows,
+# about 4k of the ~10.5k tokens every model call resends. Unset keeps the full assistant.
+TERRAFLOW_ASSISTANT_PROFILE = "TERRAFLOW_ASSISTANT_PROFILE"
+
+
+def assistant_geo_profile() -> bool:
+    return os.getenv(TERRAFLOW_ASSISTANT_PROFILE, "").strip().lower() == "geo"
+
+
+# (start marker, end marker or None for end of prompt) of each section the geo profile drops.
+GEO_PROFILE_DROPPED_SECTIONS = (
+    ("**Filesystem (sandboxed workspace", "## Creating new custom components"),
+    ("## Editing the Agent's model", "## Examples"),
+    ("### Example 3: Persona-driven Agent", None),
+)
+
+
+def _drop_sections(prompt: str, sections: tuple[tuple[str, str | None], ...]) -> str:
+    for start, end in sections:
+        i = prompt.find(start)
+        j = len(prompt) if end is None else prompt.find(end, i + 1)
+        if i < 0 or j < 0:
+            logger.warning("assistant.geo_profile.section_missing: %s", start)
+            continue
+        prompt = prompt[:i] + prompt[j:]
+    return prompt
 
 
 FLOW_BUILDER_PROMPT = """\
@@ -547,6 +577,8 @@ async def build_toolkit() -> list:
     tools: list = []
     for component in canvas_components:
         tools.extend(await component.to_toolkit())
+    if assistant_geo_profile():
+        return tools
 
     # Sandboxed filesystem tools. We instantiate a fresh component per build so
     # each request gets its own ``bound_user_id`` capture inside ``_get_tools``.
@@ -676,8 +708,11 @@ def build_system_prompt() -> str:
     unit tested directly (a tool must never be mentioned in the prompt unless
     ``build_toolkit()`` actually registers it — see ``assistant_cli_tool_enabled``).
     """
-    system_prompt = FLOW_BUILDER_PROMPT + geo_prompt_addendum()
-    if assistant_cli_tool_enabled():
+    base = FLOW_BUILDER_PROMPT
+    if assistant_geo_profile():
+        base = _drop_sections(base, GEO_PROFILE_DROPPED_SECTIONS)
+    system_prompt = base + geo_prompt_addendum()
+    if assistant_cli_tool_enabled() and not assistant_geo_profile():  # build_toolkit skips it under geo
         system_prompt += CLI_TOOL_PROMPT_ADDENDUM
     return system_prompt
 
